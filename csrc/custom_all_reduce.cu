@@ -5,6 +5,8 @@
 
 #include "custom_all_reduce.cuh"
 
+// for compile
+
 // Fake pointer type, must match fptr_t type in ops.h.
 // We use this type alias to indicate when pointers are passed in as int64_t.
 using fptr_t = int64_t;
