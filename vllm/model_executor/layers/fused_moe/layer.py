@@ -807,11 +807,15 @@ class FusedMoE(CustomOp):
         self.global_num_experts = num_experts + num_redundant_experts
 
         # we are padding globally so EP buffer allocation works
-        if quant_config and quant_config.get_name() == "mxfp4":
+        name = quant_config.get_name() if quant_config else None
+        _is_mxfp4 = name == "mxfp4"
+        _is_quark_mxfp4 = True if name == "quark" and quant_config.global_mxfp4 else False
+        self.is_mxfp4 = _is_mxfp4 or _is_quark_mxfp4
+        if self.is_mxfp4:
             from vllm.model_executor.layers.quantization.mxfp4 import (  # noqa: E501
                 should_use_flashinfer_mxfp4)
             if current_platform.is_rocm() or should_use_flashinfer_mxfp4():
-                hidden_size = round_up(hidden_size, 256)
+                hidden_size = round_up(hidden_size, 256) # 2880 -> 3072
 
         # For smuggling this layer into the fused moe custom op
         compilation_config = vllm_config.compilation_config
@@ -1167,16 +1171,48 @@ class FusedMoE(CustomOp):
                       expert_id: int,
                       return_success: bool = False) -> Optional[bool]:
 
-        if self.quant_config and self.quant_config.get_name() == "mxfp4":
-            # (FIXME) for gpt-oss all experts are combined
-            if "bias" in weight_name:
-                dim1 = loaded_weight.shape[1]
-                param.data[:, :dim1].copy_(loaded_weight)
-            else:
-                dim1 = loaded_weight.shape[1]
-                dim2 = loaded_weight.shape[2]
-                param.data[:, :dim1, :dim2].copy_(loaded_weight)
-            return True if return_success else None
+        if self.is_mxfp4:
+            if self.quant_config.get_name() == "mxfp4":
+                # (FIXME) for gpt-oss all experts are combined
+                if "bias" in weight_name:
+                    dim1 = loaded_weight.shape[1]
+                    param.data[:, :dim1].copy_(loaded_weight)
+                else:
+                    dim1 = loaded_weight.shape[1]
+                    dim2 = loaded_weight.shape[2]
+                    param.data[:, :dim1, :dim2].copy_(loaded_weight)
+                return True if return_success else None
+            elif self.quant_config.get_name() == "quark": # load weight, weight_scale, bias
+# TODO: need exclude gptoss
+                expert_data = param.data[expert_id] # [3072]
+                if "input_scale" in weight_name:
+                    expert_data.data.copy_(loaded_weight)
+                    return True if return_success else None
+
+                shard_dim = 0 if shard_id in ("w1", "w3") or "bias" in weight_name else 1
+                tp_rank = self.tp_rank
+                if shard_id == "w2":
+                    shard_size = loaded_weight.shape[shard_dim] // self.tp_size
+                    loaded_weight = loaded_weight.narrow(shard_dim,
+                                                         shard_size * tp_rank,
+                                                         shard_size)
+                    if "bias" in weight_name: # quark's shape == 2
+                        dim1 = loaded_weight.shape[0]
+                        expert_data.data[:dim1].copy_(loaded_weight)
+                    else:
+                        dim1 = loaded_weight.shape[0]
+                        dim2 = loaded_weight.shape[1]
+                        expert_data.data[:dim1, :dim2].copy_(loaded_weight)
+                elif shard_id is None: # w13
+                    if "bias" in weight_name: # quark's shape == 2
+                        dim1 = loaded_weight.shape[0]
+                        expert_data.data[:dim1].copy_(loaded_weight)
+                    else:
+                        dim1 = loaded_weight.shape[0]
+                        dim2 = loaded_weight.shape[1]
+                        expert_data.data[:dim1, :dim2].copy_(loaded_weight)
+
+                return True if return_success else None
 
         expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)
         if expert_id == -1:

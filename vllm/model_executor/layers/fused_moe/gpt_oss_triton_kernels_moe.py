@@ -127,6 +127,28 @@ def triton_kernel_fused_experts(
         (swiglu_alpha, swiglu_limit), 2)
     gammas = routing_data.gate_scal if routing_data else None
 
+    lhy = 1
+    if lhy:
+        from vllm.model_executor.layers.fused_moe.utils import (
+            moe_kernel_quantize_input)
+        # QDQ
+        # # quant_dtype = torch.float8_e5m2
+        # quant_dtype = torch.float8_e4m3fn
+        # inputs = hidden_states / a1_scale
+        # # inputs = torch.clamp(inputs, min=-57344, max=57344)
+        # inputs = torch.clamp(inputs, min=-448, max=448)
+        # hidden_states = inputs.to(quant_dtype)
+
+        quant_dtype = torch.float8_e4m3fn
+        per_channel_quant=False
+        block_shape=None
+        hidden_states, a1q_scale = moe_kernel_quantize_input(
+                A=hidden_states,
+                A_scale=a1_scale,
+                quant_dtype=quant_dtype,
+                per_act_token_quant=per_channel_quant,
+                block_shape=block_shape)
+
     intermediate_cache1 = matmul_ogs(
         hidden_states,
         w1,
@@ -136,6 +158,27 @@ def triton_kernel_fused_experts(
         precision_config=w1_precision,
         gammas=gammas if apply_router_weight_on_input else None,
         fused_activation=act)
+
+    if lhy:
+        pass
+        # when it comes to w2, out is fp8, so we need not do anything.
+        intermediate_cache1 = intermediate_cache1.to(torch.bfloat16)
+        quant_dtype = torch.float8_e4m3fn
+        per_channel_quant=False
+        block_shape=None
+        # # quant_dtype = torch.float8_e5m2
+        # quant_dtype = torch.float8_e4m3fn
+        # inputs = intermediate_cache1 / a2_scale
+        # # inputs = torch.clamp(inputs, min=-57344, max=57344)
+        # inputs = torch.clamp(inputs, min=-448, max=448)
+        # intermediate_cache1 = inputs.to(quant_dtype)
+
+        intermediate_cache1, a2_scale = moe_kernel_quantize_input(
+                A=intermediate_cache1,
+                A_scale=a2_scale,
+                quant_dtype=quant_dtype,
+                per_act_token_quant=per_channel_quant,
+                block_shape=block_shape)
 
     intermediate_cache3 = matmul_ogs(
         intermediate_cache1,
@@ -147,6 +190,8 @@ def triton_kernel_fused_experts(
         gammas=None if apply_router_weight_on_input else gammas,
         y=output_tensor,
     )
+
+    intermediate_cache3=intermediate_cache3.to(torch.bfloat16)
     return intermediate_cache3
 
 
