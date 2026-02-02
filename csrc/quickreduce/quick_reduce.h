@@ -3,6 +3,7 @@
 #include <vector>
 #include <hip/hip_runtime.h>
 #include "quick_reduce_impl.cuh"
+// #define caltime
 
 #define HIP_CHECK(err)                                                     \
   do {                                                                     \
@@ -174,6 +175,12 @@ struct DeviceComms {
     uint32_t num_blocks = divceil(msg_size, kTileSize);
     uint32_t grid = min(kMaxNumBlocks, num_blocks);
     auto quant_level_ = static_cast<QuickReduceQuantLevel>(quant_level);
+#ifdef caltime
+  hipEvent_t start, end;
+  hipEventCreate(&start);
+  hipEventCreate(&end);
+  hipEventRecord(start, stream);
+#endif
     switch (quant_level_) {
       case QuickReduceQuantLevel::INT8:
         TWOSHOT_DISPATCH(CodecQ8)
@@ -188,6 +195,15 @@ struct DeviceComms {
         TWOSHOT_DISPATCH(CodecFP)
         break;
     }
+#ifdef caltime
+  hipEventRecord(end, stream);
+  hipEventSynchronize(end);
+  float elapsed_time;
+  hipEventElapsedTime(&elapsed_time, start, end);
+  if (rank == 0) {
+  printf("msg_size:%u, quant_level:%d, qr_latency:%f\n", msg_size, quant_level, elapsed_time * 1000);
+  }
+#endif
     HIP_CHECK(cudaGetLastError());
     // Rotate the flag color.
     flag_color += divceil(N, grid);
