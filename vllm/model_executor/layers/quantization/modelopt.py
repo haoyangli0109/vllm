@@ -1132,10 +1132,14 @@ class ModelOptMxFp8Config(ModelOptQuantConfigBase):
         is_checkpoint_mxfp8_serialized: bool,
         kv_cache_quant_algo: str | None,
         exclude_modules: list[str],
+        moe_quant_algo: str | None = None,
     ) -> None:
         super().__init__(exclude_modules)
         self.quant_method = "MXFP8"
         self.is_checkpoint_mxfp8_serialized = is_checkpoint_mxfp8_serialized
+        # MiniMax-M3.1 checkpoints keep MXFP8 linears but store routed experts
+        # as compressed-tensors NVFP4 (`moe_quant_algo: NVFP4`).
+        self.moe_quant_algo = moe_quant_algo
 
         if not is_checkpoint_mxfp8_serialized:
             raise ValueError(
@@ -1171,12 +1175,25 @@ class ModelOptMxFp8Config(ModelOptQuantConfigBase):
         # (same on-disk format as ModelOpt MXFP8); normalize to the ModelOpt
         # schema and reuse the shared parser.
         if "quantization" not in config and not config.get("quant_algo"):
+            moe_quant_algo = (config.get("moe_quant_algo") or "").upper() or None
+            if moe_quant_algo is not None and (
+                moe_quant_algo != "NVFP4"
+                or config.get("moe_quant_format") != "nvfp4-pack-quantized"
+                or config.get("group_size") != 16
+            ):
+                raise ValueError(
+                    "Unsupported MXFP8 checkpoint MoE quantization: "
+                    f"moe_quant_algo={config.get('moe_quant_algo')!r}, "
+                    f"moe_quant_format={config.get('moe_quant_format')!r}, "
+                    f"group_size={config.get('group_size')!r}."
+                )
             config = {
                 "quant_method": "modelopt",
                 "quantization": {
                     "quant_algo": "MXFP8",
                     "kv_cache_quant_algo": config.get("kv_cache_quant_algo"),
                     "exclude_modules": config.get("ignored_layers", []) or [],
+                    "moe_quant_algo": moe_quant_algo,
                 },
             }
         return cast("ModelOptMxFp8Config", super().from_config(config))
@@ -1210,7 +1227,27 @@ class ModelOptMxFp8Config(ModelOptQuantConfigBase):
             is_checkpoint_mxfp8_serialized,
             kv_cache_quant_method,
             exclude_modules,
+            moe_quant_algo=original_config.get("quantization", {}).get(
+                "moe_quant_algo"
+            ),
         )
+
+    def get_quant_method(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> "QuantizeMethodBase | None":
+        if (
+            self.moe_quant_algo == "NVFP4"
+            and isinstance(layer, RoutedExperts)
+            and not self.is_layer_excluded(prefix)
+        ):
+            from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a4_nvfp4 import (  # noqa: E501
+                CompressedTensorsW4A4Nvfp4MoEMethod,
+            )
+
+            return CompressedTensorsW4A4Nvfp4MoEMethod(
+                layer.moe_config, layer_name=prefix
+            )
+        return super().get_quant_method(layer, prefix)
 
 
 class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):

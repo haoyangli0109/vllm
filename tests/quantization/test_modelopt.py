@@ -144,6 +144,45 @@ def test_modelopt_mxfp8_preserves_per_row_checkpoint_scales(dist_init, monkeypat
     assert torch.equal(linear.weight_scale, scales)
 
 
+_M31_QUANT_CONFIG = {
+    "quant_method": "mxfp8",
+    "ignored_layers": ["lm_head", "model.layers.3.block_sparse_moe.gate"],
+    "group_size": 16,
+    "moe_quant_algo": "NVFP4",
+    "moe_quant_format": "nvfp4-pack-quantized",
+}
+
+
+def test_modelopt_mxfp8_routes_nvfp4_experts_to_compressed_tensors(monkeypatch):
+    """MiniMax-M3.1 keeps MXFP8 linears but ships compressed-tensors NVFP4
+    routed experts; loading them with the MXFP8 MoE method drops weights."""
+    ct_method = Mock()
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.compressed_tensors."
+        "compressed_tensors_moe.compressed_tensors_moe_w4a4_nvfp4."
+        "CompressedTensorsW4A4Nvfp4MoEMethod",
+        ct_method,
+    )
+    config = ModelOptMxFp8Config.from_config(dict(_M31_QUANT_CONFIG))
+    layer = Mock(spec=RoutedExperts)
+    layer.moe_config = Mock()
+    prefix = "model.layers.3.block_sparse_moe.experts"
+    assert config.get_quant_method(layer, prefix) is ct_method.return_value
+    ct_method.assert_called_once_with(layer.moe_config, layer_name=prefix)
+
+    plain = ModelOptMxFp8Config.from_config({"quant_method": "mxfp8"})
+    assert plain.moe_quant_algo is None
+
+
+@pytest.mark.parametrize(
+    "override",
+    [{"moe_quant_algo": "MXFP4"}, {"moe_quant_format": "float-quantized"}],
+)
+def test_modelopt_mxfp8_rejects_unknown_expert_format(override):
+    with pytest.raises(ValueError, match="MoE quantization"):
+        ModelOptMxFp8Config.from_config({**_M31_QUANT_CONFIG, **override})
+
+
 def test_modelopt_mxfp8_pre_processed_weights_follow_kernel(monkeypatch):
     """The weight cache daemon can only serve MXFP8 layers whose kernel needs
     no post-load state beyond the parameters it exports."""
