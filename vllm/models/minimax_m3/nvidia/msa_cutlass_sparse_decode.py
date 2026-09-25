@@ -12,6 +12,7 @@ import torch
 from vllm.config.attention import MiniMaxM3MSADecodeBackend
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.v1.kv_cache_interface import get_kv_quant_mode
 
 _MAX_NUM_Q_HEADS = 64
 _MAX_NUM_KV_HEADS = 4
@@ -23,7 +24,12 @@ _TOPK = 16
 _MAX_QUERY_HEAD_ROWS = 65536
 _MAX_DECODE_QUERY_LEN = 32
 # Kernel benchmarks put the CUTLASS crossover at 16 requests for TP1 and TP4.
+# NVFP4 has no Triton fallback, so it takes CUTLASS at every batch size.
 _MIN_CUTLASS_BATCH_SIZE = 16
+
+
+def is_nvfp4_kv_cache(kv_cache_dtype: str) -> bool:
+    return get_kv_quant_mode(kv_cache_dtype).is_nvfp4
 
 
 @dataclass
@@ -214,11 +220,12 @@ def supports_cutlass_sparse_decode(
     topk_blocks: int,
 ) -> bool:
     """Return whether static model geometry supports CUTLASS sparse decode."""
+    nvfp4 = is_nvfp4_kv_cache(kv_cache_dtype)
     return (
-        decode_backend == "cutlass"
+        (decode_backend == "cutlass" or nvfp4)
         and current_platform.is_cuda()
         and current_platform.is_device_capability_family(100)
-        and kv_cache_dtype in ("fp8", "fp8_e4m3")
+        and (kv_cache_dtype in ("fp8", "fp8_e4m3") or nvfp4)
         and _supported_head_geometry(num_q_heads, num_kv_heads)
         and page_size == _PAGE_SIZE
         and topk_blocks == _TOPK
@@ -248,7 +255,7 @@ def should_prepare_decode_metadata(
             topk_blocks=topk_blocks,
         )
         and 1 <= decode_query_len <= _MAX_DECODE_QUERY_LEN
-        and batch_size >= _MIN_CUTLASS_BATCH_SIZE
+        and (batch_size >= _MIN_CUTLASS_BATCH_SIZE or is_nvfp4_kv_cache(kv_cache_dtype))
         and total_q * num_q_heads <= _MAX_QUERY_HEAD_ROWS
     )
 
@@ -292,9 +299,22 @@ def msa_cutlass_sparse_decode(
     q_scale_float: float,
     k_scale_float: float,
     v_scale_float: float,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
 ) -> None:
-    """Run CUTLASS sparse decode with metadata prepared by the MSA builder."""
-    key, value = kv_cache.split(_HEAD_DIM, dim=-1)
+    """Run CUTLASS sparse decode with metadata prepared by the MSA builder.
+
+    NVFP4 caches are uint8 ``[pages, 2 * Hkv, page_size, 72]`` (K heads, then
+    V heads) and take the device global scales ``k_scale``/``v_scale``.
+    """
+    if kv_cache.dtype == torch.uint8:
+        assert k_scale is not None and v_scale is not None
+        key, value = kv_cache.split(kv_cache.shape[1] // 2, dim=1)
+        k_scale_arg: float | torch.Tensor = k_scale
+        v_scale_arg: float | torch.Tensor = v_scale
+    else:
+        key, value = kv_cache.split(_HEAD_DIM, dim=-1)
+        k_scale_arg, v_scale_arg = k_scale_float, v_scale_float
 
     from vllm.third_party.fmha_sm100.api import fmha_sm100
 
@@ -310,7 +330,7 @@ def msa_cutlass_sparse_decode(
         output_o=True,
         sm_scale=scale,
         q_scale=q_scale_float,
-        k_scale=k_scale_float,
-        v_scale=v_scale_float,
+        k_scale=k_scale_arg,
+        v_scale=v_scale_arg,
         o_scale=1.0,
     )

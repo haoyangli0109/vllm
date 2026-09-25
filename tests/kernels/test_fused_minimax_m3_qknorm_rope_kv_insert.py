@@ -531,3 +531,111 @@ def test_sparse_full_fp8_index(num_tokens, block_size):
     # (2) Dequantized e4m3 index outputs match the bf16 reference within fp8 ulp.
     torch.testing.assert_close(iq_fp.float(), iq_bf.float(), rtol=0.13, atol=0.05)
     torch.testing.assert_close(idxc_fp.float(), idxc_bf.float(), rtol=0.13, atol=0.05)
+
+
+# ── Test 5: sparse mode with an NVFP4 main KV cache ──────────────────────────
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
+    reason="The NVFP4 reshape_and_cache_flash reference needs SM100",
+)
+@pytest.mark.parametrize("num_tokens", [1, 7, 64, 513])
+@pytest.mark.parametrize("num_kv_heads", [1, 4])
+@pytest.mark.parametrize("block_size", [16, 128])
+def test_sparse_full_nvfp4(num_tokens, num_kv_heads, block_size):
+    """The fused NVFP4 insert writes the same bytes (packed E2M1, linear K /
+    swizzled V E4M3 block scales) as reshape_and_cache_flash on the fused
+    kernel's own post-RoPE k/v, and skips padded slots."""
+    kv_cache_dtype = "nvfp4"
+    torch.manual_seed(5)
+    device, dtype, eps = "cuda", torch.bfloat16, 1e-6
+    base, max_pos = 5_000_000.0, 4096
+    num_heads, num_idx_heads = 4 * num_kv_heads, 1
+
+    weights = [
+        torch.randn(HEAD_DIM, dtype=dtype, device=device) * 0.1 for _ in range(4)
+    ]
+    cos_sin = make_cos_sin_cache(max_pos, ROTARY_DIM, base, dtype, device)
+    positions = torch.randint(
+        0, max_pos, (num_tokens,), dtype=torch.int64, device=device
+    )
+    qsz, kvsz = num_heads * HEAD_DIM, num_kv_heads * HEAD_DIM
+    iqsz = num_idx_heads * HEAD_DIM
+    qkv = torch.randn(
+        num_tokens, qsz + 2 * kvsz + iqsz + HEAD_DIM, dtype=dtype, device=device
+    )
+    qkv_orig = qkv.clone()
+
+    num_blocks = (num_tokens + block_size - 1) // block_size + 1
+    kv_cache = torch.zeros(
+        num_blocks,
+        2 * num_kv_heads,
+        block_size,
+        HEAD_DIM // 2 + HEAD_DIM // 16,
+        dtype=torch.uint8,
+        device=device,
+    )
+    index_cache = torch.zeros(
+        num_blocks, block_size, HEAD_DIM, dtype=dtype, device=device
+    )
+    slot_mapping = torch.randperm(
+        num_blocks * block_size, dtype=torch.int64, device=device
+    )[:num_tokens]
+    slot_mapping[::5] = -1  # padded / unscheduled tokens are not written
+    index_slot_mapping = torch.randperm(
+        num_blocks * block_size, dtype=torch.int64, device=device
+    )[:num_tokens]
+    k_scale = torch.tensor(0.5, dtype=torch.float32, device=device)
+    v_scale = torch.tensor(2.0, dtype=torch.float32, device=device)
+
+    ops.fused_minimax_m3_qknorm_rope_kv_insert(
+        qkv,
+        *weights[:2],
+        cos_sin,
+        positions,
+        num_heads,
+        num_kv_heads,
+        ROTARY_DIM,
+        eps,
+        *weights[2:],
+        num_idx_heads,
+        slot_mapping,
+        index_slot_mapping,
+        kv_cache,
+        index_cache,
+        block_size,
+        torch.empty(num_tokens, qsz, dtype=dtype, device=device),
+        torch.empty(num_tokens, iqsz, dtype=dtype, device=device),
+        kv_cache_dtype,
+        kv_k_scale=k_scale,
+        kv_v_scale=v_scale,
+    )
+
+    _, k_out, v_out, _, index_k = qkv.split([qsz, kvsz, kvsz, iqsz, HEAD_DIM], dim=-1)
+    torch.testing.assert_close(
+        v_out, qkv_orig.split([qsz, kvsz, kvsz, iqsz, HEAD_DIM], dim=-1)[2]
+    )
+    expected_kv_cache = torch.zeros_like(kv_cache)
+    expected_k_cache, expected_v_cache = expected_kv_cache.transpose(1, 2).split(
+        num_kv_heads, dim=-2
+    )
+    ops.reshape_and_cache_flash(
+        k_out.reshape(num_tokens, num_kv_heads, HEAD_DIM),
+        v_out.reshape(num_tokens, num_kv_heads, HEAD_DIM),
+        expected_k_cache,
+        expected_v_cache,
+        slot_mapping,
+        kv_cache_dtype,
+        k_scale,
+        v_scale,
+    )
+    assert torch.equal(kv_cache, expected_kv_cache), (
+        f"{int((kv_cache != expected_kv_cache).sum())} NVFP4 cache bytes differ"
+    )
+
+    expected_index_cache = torch.zeros_like(index_cache).view(-1, HEAD_DIM)
+    expected_index_cache[index_slot_mapping] = index_k
+    torch.testing.assert_close(
+        index_cache.view(-1, HEAD_DIM), expected_index_cache, rtol=0, atol=0
+    )

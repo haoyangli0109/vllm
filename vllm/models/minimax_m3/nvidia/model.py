@@ -496,6 +496,8 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         # of wrapping the generic Attention module. Keep the same runtime scale
         # attributes so FP8 KV reads can honor vLLM's per-layer descale contract.
         set_default_quant_scales(self, register_buffer=True)
+        # The fused insert quantizes k/v into NVFP4 pages with these scales.
+        self.use_nvfp4_kv = get_kv_quant_mode(self.kv_cache_dtype).is_nvfp4
         # Indexer side-cache dtype, mirroring --kv-cache-dtype for the main
         # cache (--attention-config '{"indexer_kv_dtype": ...}').
         self.indexer_kv_dtype = vllm_config.attention_config.resolve_indexer_kv_dtype(
@@ -637,6 +639,8 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             self.kv_cache_dtype,
             q_fp8_out=query_fp8,
             q_fp8_scale=self._q_scale_float,
+            kv_k_scale=self._k_scale if self.use_nvfp4_kv else None,
+            kv_v_scale=self._v_scale if self.use_nvfp4_kv else None,
         )
 
         output = torch.empty_like(q)

@@ -286,6 +286,135 @@ __device__ __forceinline__ void storeScaledQElemsFp8(
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// NVFP4 main K/V cache store
+// ────────────────────────────────────────────────────────────────────────────
+// Byte-for-byte the layout and scale math of reshape_and_cache_nvfp4_kernel
+// (nvfp4_kv_cache_kernels.cu), so the MSA and FlashInfer NVFP4 readers accept
+// it. Each HND page is [K side | V side]; a side is every head's packed E2M1
+// data [nkv, bs, 64] followed by its E4M3 block scales [nkv, bs, 8]. K scales
+// are linear, V scales use the SM100 trtllm-gen 4x4 token-quad swizzle. One
+// 16-element scale group is four lanes. SM100-family builds of this file
+// (CMake gives it family-specific SM10x/11x targets) encode E2M1 with
+// cvt.rn.satfinite.e2m1x2; other targets use a bit-exact software encoder.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000 && \
+    defined(__CUDA_ARCH_FAMILY_SPECIFIC__)
+  #define MINIMAX_M3_NVFP4_NATIVE_CVT 1
+#else
+  #define MINIMAX_M3_NVFP4_NATIVE_CVT 0
+#endif
+constexpr int kNvfp4DataBytes = kHeadDim / 2;            // 64
+constexpr int kNvfp4ScaleBytes = kHeadDim / 16;          // 8
+constexpr int kNvfp4LanesPerGroup = 16 / kElemsPerLane;  // 4
+
+__device__ __forceinline__ float rcpApproxFtz(float a) {
+  float b;
+  asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(b) : "f"(a));
+  return b;
+}
+
+// Round-to-nearest-even, saturating E2M1 code of ``x`` (matches
+// cvt.rn.satfinite.e2m1x2.f32). Below 1 the grid is the 0.5-step subnormals;
+// from 1 up it is fp32 rounded to one mantissa bit, whose (exponent, mantissa)
+// bits are the code offset by 252 once the exponent is rebiased.
+__device__ __forceinline__ uint32_t e2m1Code(float x) {
+  float const ax = fabsf(x);
+  uint32_t mag;
+  if (ax < 1.0f) {
+    mag = static_cast<uint32_t>(__float2int_rn(2.0f * ax));
+  } else {
+    uint32_t const bits = __float_as_uint(ax);
+    uint32_t const rounded = bits + 0x1FFFFFu + ((bits >> 22) & 1u);
+    mag = min((rounded >> 22) - 252u, 7u);
+  }
+  return mag | ((__float_as_uint(x) >> 28) & 0x8u);
+}
+
+#ifndef USE_ROCM
+// E4M3 block scale for a group whose largest magnitude maps to 6, and the
+// factor that takes a value to its E2M1 code.
+__device__ __forceinline__ void nvfp4GroupScale(float sf_scale, float group_max,
+                                                uint8_t& sf_byte,
+                                                float& quant_scale) {
+  __nv_fp8_e4m3 const sf(sf_scale * (group_max * rcpApproxFtz(6.0f)));
+  sf_byte = reinterpret_cast<uint8_t const&>(sf);
+  float const sf_value = float(sf);
+  quant_scale =
+      sf_value != 0.0f ? rcpApproxFtz(sf_value * rcpApproxFtz(sf_scale)) : 0.0f;
+}
+
+// Quantize one K or V head row of one token into its NVFP4 page, where
+// ``sf_scale`` is 1 / the dequantization (global) scale. Every lane of the
+// warp must call this (the scale-group reductions shuffle).
+template <typename scalar_t>
+__device__ __forceinline__ void storeNvfp4CacheElems(
+    uint8_t* __restrict__ page, int const kv, int const head, int const token,
+    int const nkv, int const block_size, int const laneId,
+    float const (&elems)[kElemsPerLane], float const sf_scale) {
+  // Quantize the model-dtype value that the unfused path reads back from qkv.
+  using Converter = vllm::_typeConvert<scalar_t>;
+  float x[kElemsPerLane];
+  float group_max = 0.0f;
+  #pragma unroll
+  for (int i = 0; i < kElemsPerLane; i++) {
+    x[i] = static_cast<float>(Converter::convert(elems[i]));
+    group_max = fmaxf(group_max, fabsf(x[i]));
+  }
+  group_max = fmaxf(group_max, __shfl_xor_sync(FINAL_MASK, group_max, 1, 32));
+  group_max = fmaxf(group_max, __shfl_xor_sync(FINAL_MASK, group_max, 2, 32));
+
+  uint8_t sf_byte;
+  float quant_scale;
+  nvfp4GroupScale(sf_scale, group_max, sf_byte, quant_scale);
+
+  uint16_t packed;
+  #if MINIMAX_M3_NVFP4_NATIVE_CVT
+  // Low nibble = even element; cvt packs its first source in the high nibble.
+  asm("{\n"
+      "  .reg .b8 lo, hi;\n"
+      "  cvt.rn.satfinite.e2m1x2.f32 lo, %2, %1;\n"
+      "  cvt.rn.satfinite.e2m1x2.f32 hi, %4, %3;\n"
+      "  mov.b16 %0, {lo, hi};\n"
+      "}"
+      : "=h"(packed)
+      : "f"(x[0] * quant_scale), "f"(x[1] * quant_scale),
+        "f"(x[2] * quant_scale), "f"(x[3] * quant_scale));
+  #else
+  uint32_t codes = 0;
+    #pragma unroll
+  for (int i = 0; i < kElemsPerLane; i++) {
+    codes |= e2m1Code(x[i] * quant_scale) << (4 * i);
+  }
+  packed = static_cast<uint16_t>(codes);
+  #endif
+
+  int64_t const side_bytes = static_cast<int64_t>(nkv) * block_size *
+                             (kNvfp4DataBytes + kNvfp4ScaleBytes);
+  uint8_t* const side = page + kv * side_bytes;
+  uint8_t* const data =
+      side +
+      (static_cast<int64_t>(head) * block_size + token) * kNvfp4DataBytes +
+      laneId * (kElemsPerLane / 2);
+  *reinterpret_cast<uint16_t*>(data) = packed;
+
+  if (laneId % kNvfp4LanesPerGroup == 0) {
+    int const group = laneId / kNvfp4LanesPerGroup;
+    int offset;
+    if (kv == 0) {
+      offset = token * kNvfp4ScaleBytes + group;
+    } else {
+      constexpr int kGroupsPerQuad = kNvfp4ScaleBytes / 4;
+      int const swizzled_t = (token / 4) * 4 + group / kGroupsPerQuad;
+      int const swizzled_s = (group % kGroupsPerQuad) * 4 + token % 4;
+      offset = swizzled_t * kNvfp4ScaleBytes + swizzled_s;
+    }
+    side[static_cast<int64_t>(nkv) * block_size * kNvfp4DataBytes +
+         static_cast<int64_t>(head) * block_size * kNvfp4ScaleBytes + offset] =
+        sf_byte;
+  }
+}
+#endif  // USE_ROCM
+
+// ────────────────────────────────────────────────────────────────────────────
 // Kernel
 // ────────────────────────────────────────────────────────────────────────────
 // Grid: 1D, ceil(num_tokens * slots_per_token / warps_per_block).
@@ -307,9 +436,8 @@ __device__ __forceinline__ void storeScaledQElemsFp8(
 // branch and writes index_q/index_k outputs. Skip-index-topk reuse layers keep
 // kHasIndex=true but set kProcessIndex=false.
 template <typename scalar_t, typename cache_t, Fp8KVCacheDataType kv_dt,
-          typename out_idx_t, bool kHasIndex, bool kInsertKV,
-          bool kProcessIndex,
-          bool kFp8Idx>
+          bool kNvfp4, typename out_idx_t, bool kHasIndex, bool kInsertKV,
+          bool kProcessIndex, bool kFp8Idx>
 __global__ void fusedMiniMaxM3QNormRopeKVInsertKernel(
     scalar_t* __restrict__ qkv,  // [N, qkv_row] in/out (packs index if sparse)
     scalar_t* __restrict__ q_out,         // [N, nq*128] contiguous, or nullptr
@@ -332,7 +460,10 @@ __global__ void fusedMiniMaxM3QNormRopeKVInsertKernel(
     // The content (last) dim is always innermost-contiguous (stride 1), so the
     // NHD/HND layout choice is captured by the head/token strides.
     int64_t const kv_s_block, int64_t const kv_s_head, int64_t const kv_s_token,
-    int64_t const kv_s_dim) {
+    int64_t const kv_s_dim,
+    // NVFP4 main cache only: per-layer K/V dequantization (global) scales.
+    float const* __restrict__ kv_k_scale,
+    float const* __restrict__ kv_v_scale) {
 #if (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ < 800) && !defined(USE_ROCM)
   // _typeConvert<BFloat16> is unavailable on pre-Ampere; the M3 kernel only
   // runs with bf16/fp16 inputs in practice.  Discard the bf16 body there.
@@ -433,6 +564,15 @@ __global__ void fusedMiniMaxM3QNormRopeKVInsertKernel(
       }
     }
 
+    // NVFP4: the per-layer global scale is not produced by the predecessor,
+    // so load it before the PDL wait. __frcp_rn is exactly 1.0f / scale.
+    float nvfp4_sf_scale = 0.0f;
+    if constexpr (kNvfp4) {
+      if (isK || isV) {
+        nvfp4_sf_scale = __frcp_rn(isK ? *kv_k_scale : *kv_v_scale);
+      }
+    }
+
     // PDL: wait for the predecessor kernel (the qkv-projection GEMM that
     // produces ``qkv``) to finish before touching any global memory.  No-op
     // when PDL is not enabled on the launch.  The CUDA runtime wrapper emits
@@ -487,6 +627,16 @@ __global__ void fusedMiniMaxM3QNormRopeKVInsertKernel(
           } else {
             storeElems<scalar_t>(index_cache + sm * kHeadDim + dim_base, elems);
           }
+        } else if constexpr (kNvfp4) {
+#ifndef USE_ROCM
+          // kv_cache is [num_blocks, 2*nkv, block_size, 72] bytes (HND);
+          // kv_s_block is its page stride.
+          storeNvfp4CacheElems<scalar_t>(
+              reinterpret_cast<uint8_t*>(kv_cache) +
+                  (sm / block_size) * kv_s_block,
+              isK ? 0 : 1, head, static_cast<int>(sm % block_size), nkv,
+              block_size, laneId, elems, nvfp4_sf_scale);
+#endif
         } else if (isK || isV) {
           // kv_cache logical shape [num_blocks, nkv, block_size, 2*head_dim].
           // Paging is logical (block = sm/block_size, token = sm%block_size);
@@ -515,7 +665,8 @@ __global__ void fusedMiniMaxM3QNormRopeKVInsertKernel(
 // ────────────────────────────────────────────────────────────────────────────
 // Launch wrapper
 // ────────────────────────────────────────────────────────────────────────────
-template <typename scalar_t, typename cache_t, Fp8KVCacheDataType kv_dt>
+template <typename scalar_t, typename cache_t, Fp8KVCacheDataType kv_dt,
+          bool kNvfp4 = false>
 void launchFusedMiniMaxM3(
     scalar_t* qkv, scalar_t* q_out, uint8_t* q_fp8_out, void* index_q_out,
     scalar_t const* q_norm_w, scalar_t const* k_norm_w,
@@ -527,7 +678,8 @@ void launchFusedMiniMaxM3(
     int const nq, int const nkv, int const niq, int const block_size,
     int64_t const kv_s_block, int64_t const kv_s_head, int64_t const kv_s_token,
     int64_t const kv_s_dim, bool const has_index, bool const insert_kv,
-    bool const process_index, bool const fp8_idx, cudaStream_t stream) {
+    bool const process_index, bool const fp8_idx, float const* kv_k_scale,
+    float const* kv_v_scale, cudaStream_t stream) {
   // Index outputs are scalar_t (bf16) or e4m3 bytes (uint8_t); reinterpret the
   // void* pointers per instantiation in the LAUNCH macro.
   // Slot count must match the kernel's compile-time gating.
@@ -559,35 +711,44 @@ void launchFusedMiniMaxM3(
   config.attrs = attrs;
   config.numAttrs = (sm_version >= 90) ? 1 : 0;
 
-  #define LAUNCH(HAS_INDEX, INSERT, PROCESS_INDEX, FP8, OUT_T)                 \
-    cudaLaunchKernelEx(                                                        \
-        &config,                                                               \
-        fusedMiniMaxM3QNormRopeKVInsertKernel<scalar_t, cache_t, kv_dt, OUT_T, \
-                                              HAS_INDEX, INSERT,               \
-                                              PROCESS_INDEX, FP8>,             \
-        qkv, q_out, q_fp8_out, reinterpret_cast<OUT_T*>(index_q_out),          \
-        q_norm_w, k_norm_w, iq_norm_w, ik_norm_w, cos_sin_cache, positions,    \
-        slot_mapping, index_slot_mapping, kv_cache,                            \
-        reinterpret_cast<OUT_T*>(index_cache), eps, q_fp8_inv_scale,           \
-        rotary_dim, num_tokens, nq, nkv, niq, block_size, kv_s_block,          \
-        kv_s_head, kv_s_token, kv_s_dim)
-#else
-  // ROCm: standard kernel launch syntax (no PDL/stream serialization).
-  // clang-format off
   #define LAUNCH(HAS_INDEX, INSERT, PROCESS_INDEX, FP8, OUT_T)              \
-    fusedMiniMaxM3QNormRopeKVInsertKernel<                                  \
-        scalar_t, cache_t, kv_dt, OUT_T, HAS_INDEX, INSERT, PROCESS_INDEX,  \
-        FP8><<<grid, kBlockSize, 0, stream>>>(                              \
+    cudaLaunchKernelEx(                                                     \
+        &config,                                                            \
+        fusedMiniMaxM3QNormRopeKVInsertKernel<scalar_t, cache_t, kv_dt,     \
+                                              kNvfp4, OUT_T, HAS_INDEX,     \
+                                              INSERT, PROCESS_INDEX, FP8>,  \
         qkv, q_out, q_fp8_out, reinterpret_cast<OUT_T*>(index_q_out),       \
         q_norm_w, k_norm_w, iq_norm_w, ik_norm_w, cos_sin_cache, positions, \
         slot_mapping, index_slot_mapping, kv_cache,                         \
         reinterpret_cast<OUT_T*>(index_cache), eps, q_fp8_inv_scale,        \
         rotary_dim, num_tokens, nq, nkv, niq, block_size, kv_s_block,       \
-        kv_s_head, kv_s_token, kv_s_dim)
+        kv_s_head, kv_s_token, kv_s_dim, kv_k_scale, kv_v_scale)
+#else
+  // ROCm: standard kernel launch syntax (no PDL/stream serialization).
+  // clang-format off
+  #define LAUNCH(HAS_INDEX, INSERT, PROCESS_INDEX, FP8, OUT_T)              \
+    fusedMiniMaxM3QNormRopeKVInsertKernel<                                  \
+        scalar_t, cache_t, kv_dt, kNvfp4, OUT_T, HAS_INDEX, INSERT,         \
+        PROCESS_INDEX, FP8><<<grid, kBlockSize, 0, stream>>>(               \
+        qkv, q_out, q_fp8_out, reinterpret_cast<OUT_T*>(index_q_out),       \
+        q_norm_w, k_norm_w, iq_norm_w, ik_norm_w, cos_sin_cache, positions, \
+        slot_mapping, index_slot_mapping, kv_cache,                         \
+        reinterpret_cast<OUT_T*>(index_cache), eps, q_fp8_inv_scale,        \
+        rotary_dim, num_tokens, nq, nkv, niq, block_size, kv_s_block,       \
+        kv_s_head, kv_s_token, kv_s_dim, kv_k_scale, kv_v_scale)
   // clang-format on
 #endif
 
-  if (has_index) {
+  if constexpr (kNvfp4) {
+    // NVFP4 main cache: sparse serving only (the host checks insert_kv).
+    if (!process_index) {
+      LAUNCH(true, true, false, false, scalar_t);
+    } else if (fp8_idx) {
+      LAUNCH(true, true, true, true, uint8_t);
+    } else {
+      LAUNCH(true, true, true, false, scalar_t);
+    }
+  } else if (has_index) {
     if (!process_index) {
       if (insert_kv) {
         LAUNCH(true, true, false, false, scalar_t);
@@ -621,8 +782,9 @@ void launchFusedMiniMaxM3(
 }  // namespace vllm
 
 // clang-format off
-#define CALL_FUSED_MINIMAX_M3(_RAW_T, CACHE_T, KV_DTYPE)                       \
-  vllm::minimax_m3_fused_ops::launchFusedMiniMaxM3<st, CACHE_T, KV_DTYPE>(     \
+#define CALL_FUSED_MINIMAX_M3_IMPL(CACHE_T, KV_DTYPE, NVFP4)              \
+  vllm::minimax_m3_fused_ops::launchFusedMiniMaxM3<st, CACHE_T, KV_DTYPE,      \
+                                                   NVFP4>(                \
       reinterpret_cast<st*>(qkv.data_ptr()),                                   \
       q_out.has_value() ? reinterpret_cast<st*>(q_out->data_ptr()) : nullptr,  \
       q_fp8_out.has_value()                                                     \
@@ -654,7 +816,10 @@ void launchFusedMiniMaxM3(
       static_cast<float>(eps), 1.0f / static_cast<float>(q_fp8_scale),          \
       static_cast<int>(rotary_dim), num_tokens, nq, nkv, niq,                  \
       static_cast<int>(block_size), kv_s_block, kv_s_head, kv_s_token,         \
-      kv_s_dim, has_index, insert_kv, process_index, fp8_idx, stream)
+      kv_s_dim, has_index, insert_kv, process_index, fp8_idx, kv_k_scale_ptr,  \
+      kv_v_scale_ptr, stream)
+#define CALL_FUSED_MINIMAX_M3(_RAW_T, CACHE_T, KV_DTYPE)                       \
+  CALL_FUSED_MINIMAX_M3_IMPL(CACHE_T, KV_DTYPE, false)
 // clang-format on
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -681,7 +846,9 @@ void fused_minimax_m3_qknorm_rope_kv_insert(
     const std::string& kv_cache_dtype, bool skip_index_branch,
     std::optional<torch::stable::Tensor>
         q_fp8_out,  // [N, nq*128] contiguous E4M3
-    double q_fp8_scale) {
+    double q_fp8_scale,
+    std::optional<torch::stable::Tensor> kv_k_scale,  // [] f32, NVFP4 only
+    std::optional<torch::stable::Tensor> kv_v_scale) {
   STD_TORCH_CHECK(qkv.is_cuda() && qkv.is_contiguous(),
                   "qkv must be contiguous CUDA");
   STD_TORCH_CHECK(
@@ -721,8 +888,10 @@ void fused_minimax_m3_qknorm_rope_kv_insert(
   bool const has_index = niq > 0;
   bool const insert_kv = kv_cache.has_value();
   bool const process_index = has_index && !skip_index_branch;
+  bool const nvfp4_kv = kv_cache_dtype == "nvfp4";
   vllm::Fp8KVCacheDataType const kv_dt =
-      vllm::get_fp8_kv_cache_data_type(kv_cache_dtype);
+      nvfp4_kv ? vllm::Fp8KVCacheDataType::kAuto
+               : vllm::get_fp8_kv_cache_data_type(kv_cache_dtype);
   int const kHeadDim = vllm::minimax_m3_fused_ops::kHeadDim;
   int const expected_row =
       (nq + 2 * nkv + (has_index ? niq + 1 : 0)) * kHeadDim;
@@ -769,8 +938,13 @@ void fused_minimax_m3_qknorm_rope_kv_insert(
                index_slot_mapping->numel() == slot_mapping->numel()),
           "index_slot_mapping must be int64 CUDA with slot_mapping length");
     }
-    // Main attention KV cache: auto matches qkv, fp8 uses uint8 storage.
-    if (kv_dt == vllm::Fp8KVCacheDataType::kAuto) {
+    // Main attention KV cache: auto matches qkv, fp8 and nvfp4 use uint8
+    // storage.
+    if (nvfp4_kv) {
+      STD_TORCH_CHECK(
+          kv_cache->scalar_type() == torch::headeronly::ScalarType::Byte,
+          "nvfp4 kv_cache must use uint8 storage");
+    } else if (kv_dt == vllm::Fp8KVCacheDataType::kAuto) {
       STD_TORCH_CHECK(kv_cache->scalar_type() == qkv.scalar_type(),
                       "auto kv_cache dtype must match qkv");
     } else {
@@ -790,6 +964,27 @@ void fused_minimax_m3_qknorm_rope_kv_insert(
     STD_TORCH_CHECK(kv_cache->dim() == 4 && kv_cache->stride(3) == 1,
                     "kv_cache must be [nb,nkv,bs,2*head_dim] with contiguous "
                     "content dim (stride(3)==1)");
+    if (nvfp4_kv) {
+      // Packed HND pages [nb, 2*nkv, bs, 72]: every (side, head) block is
+      // contiguous inside the page, which the store addresses directly.
+      int64_t const full_dim = kHeadDim / 2 + kHeadDim / 16;
+      STD_TORCH_CHECK(
+          kv_cache->size(1) == 2 * nkv && kv_cache->size(2) == block_size &&
+              kv_cache->size(3) == full_dim &&
+              kv_cache->stride(2) == full_dim &&
+              kv_cache->stride(1) == block_size * full_dim &&
+              block_size % 4 == 0,
+          "nvfp4 kv_cache must be HND [nb, 2*num_kv_heads, block_size, 72] "
+          "with contiguous pages and block_size % 4 == 0");
+      for (auto const* scale : {&kv_k_scale, &kv_v_scale}) {
+        STD_TORCH_CHECK(
+            scale->has_value() && (*scale)->is_cuda() &&
+                (*scale)->scalar_type() ==
+                    torch::headeronly::ScalarType::Float &&
+                (*scale)->numel() >= 1,
+            "nvfp4 kv_cache requires float32 CUDA kv_k_scale and kv_v_scale");
+      }
+    }
     kv_s_block = kv_cache->stride(0);
     kv_s_head = kv_cache->stride(1);
     kv_s_token = kv_cache->stride(2);
@@ -854,9 +1049,30 @@ void fused_minimax_m3_qknorm_rope_kv_insert(
         "fp8 index path: index_q_out must be fp8 e4m3");
   }
 
+  STD_TORCH_CHECK(!nvfp4_kv || insert_kv,
+                  "nvfp4 kv_cache_dtype requires kv_cache (insert mode)");
+  float const* kv_k_scale_ptr =
+      nvfp4_kv ? kv_k_scale->const_data_ptr<float>() : nullptr;
+  float const* kv_v_scale_ptr =
+      nvfp4_kv ? kv_v_scale->const_data_ptr<float>() : nullptr;
+
   const torch::stable::accelerator::DeviceGuard device_guard(
       qkv.get_device_index());
   auto stream = get_current_cuda_stream(qkv.get_device_index());
+
+  if (nvfp4_kv) {
+#ifndef USE_ROCM
+    VLLM_STABLE_DISPATCH_HALF_TYPES(
+        qkv.scalar_type(), "fused_minimax_m3_qknorm_rope_kv_insert_nvfp4", [&] {
+          using st = scalar_t;
+          CALL_FUSED_MINIMAX_M3_IMPL(uint8_t, vllm::Fp8KVCacheDataType::kAuto,
+                                     true);
+        });
+#else
+    STD_TORCH_CHECK(false, "nvfp4 kv_cache is not supported on ROCm");
+#endif
+    return;
+  }
 
   VLLM_STABLE_DISPATCH_HALF_TYPES(
       qkv.scalar_type(), "fused_minimax_m3_qknorm_rope_kv_insert", [&] {
@@ -867,3 +1083,4 @@ void fused_minimax_m3_qknorm_rope_kv_insert(
 }
 
 #undef CALL_FUSED_MINIMAX_M3
+#undef CALL_FUSED_MINIMAX_M3_IMPL

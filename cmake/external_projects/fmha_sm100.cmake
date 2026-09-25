@@ -17,7 +17,7 @@ else()
   FetchContent_Declare(
     fmha_sm100
     GIT_REPOSITORY https://github.com/vllm-project/MSA.git
-    GIT_TAG f355c37eb4e1413f21ee2ad8bbad25079e6bef9d
+    GIT_TAG b8e0770f9bf922e021b0ebbc84c70ca68dba60ec
     GIT_PROGRESS TRUE
     CONFIGURE_COMMAND ""
     BUILD_COMMAND ""
@@ -50,6 +50,12 @@ install(DIRECTORY "${FMHA_SM100_PY_ROOT}/csrc/"
   PATTERN "__pycache__" EXCLUDE
   PATTERN "*.pyc" EXCLUDE
   PATTERN ".git*" EXCLUDE)
+
+install(DIRECTORY "${FMHA_SM100_PY_ROOT}/kvouter/"
+  DESTINATION vllm/third_party/fmha_sm100/kvouter
+  COMPONENT fmha_sm100
+  PATTERN "__pycache__" EXCLUDE
+  PATTERN "*.pyc" EXCLUDE)
 
 install(DIRECTORY "${FMHA_SM100_PY_ROOT}/cute/"
   DESTINATION vllm/third_party/fmha_sm100/cute

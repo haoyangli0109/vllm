@@ -2587,6 +2587,8 @@ def fused_minimax_m3_qknorm_rope_kv_insert(
     skip_index_branch: bool = False,
     q_fp8_out: torch.Tensor | None = None,
     q_fp8_scale: float = 1.0,
+    kv_k_scale: torch.Tensor | None = None,
+    kv_v_scale: torch.Tensor | None = None,
 ) -> None:
     """Fused MiniMax-M3 attention pre-processing (in-place).
 
@@ -2611,6 +2613,11 @@ def fused_minimax_m3_qknorm_rope_kv_insert(
 
     If ``q_fp8_out`` is given, the same normalized q is also written in FP8
     E4M3 using ``q_fp8_scale`` as its dequantization scale.
+
+    ``kv_cache_dtype`` ``nvfp4``/``nvfp4_4over6`` quantizes k/v into the packed
+    HND ``[num_blocks, 2 * num_kv_heads, block_size, 72]`` uint8 cache (the
+    ``reshape_and_cache_flash`` NVFP4 layout) using the device dequantization
+    scales ``kv_k_scale``/``kv_v_scale``.
 
     When ``skip_index_branch`` is true, sparse rows still keep their packed
     ``[index_q | index_k]`` tail, but the kernel only processes the main q/k/v
@@ -2641,6 +2648,8 @@ def fused_minimax_m3_qknorm_rope_kv_insert(
         skip_index_branch,
         q_fp8_out,
         q_fp8_scale,
+        kv_k_scale,
+        kv_v_scale,
     )
 
 

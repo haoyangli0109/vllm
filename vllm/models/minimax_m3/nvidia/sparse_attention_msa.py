@@ -4,15 +4,18 @@
 
 Prefill attends with ``fmha_sm100`` (``build_k2q_csr`` + ``sparse_atten_func``).
 Decode uses Triton split-K by default, with an opt-in CUTLASS ``fmha_sm100``
-path for regular decode and speculative verification.
+path for regular decode and speculative verification. NVFP4 KV caches read the
+vLLM packed pages directly in both prefill and CUTLASS decode.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from typing import ClassVar
 
 import torch
 
 from vllm.config import VllmConfig
 from vllm.config.attention import MiniMaxM3MSADecodeBackend
+from vllm.config.cache import CacheDType
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.models.minimax_m3.common.ops.sparse_attn import (
@@ -29,18 +32,43 @@ from vllm.models.minimax_m3.common.sparse_attention import (
 from vllm.models.minimax_m3.nvidia.msa_cutlass_sparse_decode import (
     MSACutlassDecodeMetadata,
     MSACutlassDecodePlanCache,
+    is_nvfp4_kv_cache,
     msa_cutlass_sparse_decode,
     prepare_decode_metadata,
     should_prepare_decode_metadata,
     supports_cutlass_sparse_decode,
 )
+from vllm.utils.torch_utils import get_dtype_size, nvfp4_kv_cache_full_dim
 from vllm.v1.attention.backend import (
     AttentionLayer,
     CommonAttentionMetadata,
 )
-from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayout
 
 logger = init_logger(__name__)
+
+# Per KV side of a HND NVFP4 page: all heads' packed E2M1 data, then all heads'
+# E4M3 block scales (see ``nvfp4_split_data_scale``).
+_NVFP4_DATA_BYTES_PER_HEAD = SPARSE_BLOCK_SIZE * 64
+_NVFP4_SCALE_BYTES_PER_HEAD = SPARSE_BLOCK_SIZE * 8
+
+
+def _nvfp4_data_scale_views(
+    kv_side: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Split one ``[pages, Hkv, 128, 72]`` side into data and scale views."""
+    pages, heads = kv_side.shape[:2]
+    page_stride = kv_side.stride(0)
+    data = kv_side.as_strided(
+        (pages, heads, SPARSE_BLOCK_SIZE, 64),
+        (page_stride, _NVFP4_DATA_BYTES_PER_HEAD, 64, 1),
+    )
+    scale = kv_side.as_strided(
+        (pages, heads, SPARSE_BLOCK_SIZE, 8),
+        (page_stride, _NVFP4_SCALE_BYTES_PER_HEAD, 8, 1),
+        kv_side.storage_offset() + heads * _NVFP4_DATA_BYTES_PER_HEAD,
+    )
+    return data, scale
 
 
 class MiniMaxM3SparseMSABackend(MiniMaxM3SparseBackend):
@@ -49,6 +77,29 @@ class MiniMaxM3SparseMSABackend(MiniMaxM3SparseBackend):
     @staticmethod
     def get_builder_cls() -> type["MiniMaxM3SparseMSAMetadataBuilder"]:
         return MiniMaxM3SparseMSAMetadataBuilder
+
+
+class MiniMaxM3SparseMSANvfp4Backend(MiniMaxM3SparseMSABackend):
+    """MSA backend over vLLM's HND NVFP4 KV cache pages."""
+
+    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = ["nvfp4"]
+
+    @classmethod
+    def customize_spec(cls, spec: AttentionSpec) -> AttentionSpec:
+        """Store K and V as separate head slots of packed data + block scales."""
+        if spec.state_content_bytes is not None or not spec.kv_quant_mode.is_nvfp4:
+            return spec
+        return replace(
+            spec,
+            num_head_slots=2 * spec.num_kv_heads,
+            state_content_bytes=nvfp4_kv_cache_full_dim(spec.head_size)
+            * get_dtype_size(spec.dtype),
+        )
+
+    @classmethod
+    def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...] | None:
+        # The MSA NVFP4 readers assume head-major data and scale regions.
+        return (KVCacheLayout.LBHNC,)
 
 
 class MiniMaxM3SparseCutlassBackend(MiniMaxM3SparseMSABackend):
@@ -166,6 +217,7 @@ class MiniMaxM3SparseMSAImpl(MiniMaxM3SparseImpl):
             topk_blocks=topk_blocks,
             sparse_block_size=sparse_block_size,
         )
+        self.use_nvfp4_kv = is_nvfp4_kv_cache(kv_cache_dtype)
         self.use_cutlass_decode = supports_cutlass_sparse_decode(
             decode_backend=msa_decode_backend,
             num_q_heads=self.num_heads,
@@ -174,6 +226,12 @@ class MiniMaxM3SparseMSAImpl(MiniMaxM3SparseImpl):
             page_size=self.block_size,
             topk_blocks=self.topk_blocks,
         )
+        if self.use_nvfp4_kv and not self.use_cutlass_decode:
+            raise ValueError(
+                "MiniMax M3 NVFP4 KV cache requires CUTLASS MSA sparse decode "
+                f"(num_heads={self.num_heads}, num_kv_heads={self.num_kv_heads}, "
+                f"block_size={self.block_size}, topk_blocks={self.topk_blocks})"
+            )
         logger.info_once(
             "MiniMax M3 MSA sparse decode selected %s",
             "CUTLASS" if self.use_cutlass_decode else "Triton",
@@ -218,9 +276,8 @@ class MiniMaxM3SparseMSAImpl(MiniMaxM3SparseImpl):
         hd = self.head_size
         q = query[:num_tokens].view(-1, self.num_heads, hd)
         out = output[:num_tokens].view(-1, self.num_heads, hd)
-        kv_cache = (
-            kv_cache.view(self.kv_cache_fp8_dtype) if self.use_fp8_kv else kv_cache
-        )
+        if self.use_fp8_kv and not self.use_nvfp4_kv:
+            kv_cache = kv_cache.view(self.kv_cache_fp8_dtype)
         k_scale = getattr(layer, "_k_scale", None) if self.use_fp8_kv else None
         v_scale = getattr(layer, "_v_scale", None) if self.use_fp8_kv else None
 
@@ -245,6 +302,14 @@ class MiniMaxM3SparseMSAImpl(MiniMaxM3SparseImpl):
                     q_scale_float=getattr(layer, "_q_scale_float", 1.0),
                     k_scale_float=getattr(layer, "_k_scale_float", 1.0),
                     v_scale_float=getattr(layer, "_v_scale_float", 1.0),
+                    k_scale=k_scale if self.use_nvfp4_kv else None,
+                    v_scale=v_scale if self.use_nvfp4_kv else None,
+                )
+            elif self.use_nvfp4_kv:
+                raise RuntimeError(
+                    "MiniMax M3 NVFP4 KV cache has no Triton decode fallback; "
+                    f"CUTLASS decode was not planned for {main_md.num_decodes} "
+                    f"requests with query length {d.decode_query_len}"
                 )
             else:
                 minimax_m3_sparse_attn_decode(
@@ -266,6 +331,7 @@ class MiniMaxM3SparseMSAImpl(MiniMaxM3SparseImpl):
             from vllm.third_party.fmha_sm100.sparse import (
                 build_k2q_csr,
                 sparse_atten_func,
+                sparse_atten_nvfp4_kv_func,
             )
 
             p = main_md.prefill
@@ -274,7 +340,6 @@ class MiniMaxM3SparseMSAImpl(MiniMaxM3SparseImpl):
             # strided view directly (topK stays innermost-contiguous).
             prefill_topk = topk[nd:num_tokens].transpose(0, 1)
             qp = q[nd:]
-            k_cache, v_cache = kv_cache.split(self.head_size, dim=-1)
             k2q_row_ptr, k2q_q_indices, schedule = build_k2q_csr(
                 prefill_topk,
                 p.cu_seqlens_q,
@@ -287,6 +352,36 @@ class MiniMaxM3SparseMSAImpl(MiniMaxM3SparseImpl):
                 qhead_per_kv=qp.shape[1] // self.num_kv_heads,
                 return_schedule=True,
             )
+            if self.use_nvfp4_kv:
+                k_side, v_side = kv_cache.split(self.num_kv_heads, dim=1)
+                k_data, k_sf = _nvfp4_data_scale_views(k_side)
+                v_data, v_sf = _nvfp4_data_scale_views(v_side)
+                sparse_atten_nvfp4_kv_func(
+                    qp,
+                    k_data,
+                    v_data,
+                    k_sf,
+                    v_sf,
+                    k_scale,
+                    v_scale,
+                    k2q_row_ptr,
+                    k2q_q_indices,
+                    self.topk_blocks,
+                    cu_seqlens_q=p.cu_seqlens_q,
+                    cu_seqlens_k=p.cu_seqlens_k,
+                    max_seqlen_q=p.max_query_len,
+                    max_seqlen_k=p.max_seq_len,
+                    blk_kv=SPARSE_BLOCK_SIZE,
+                    causal=True,
+                    softmax_scale=self.scale,
+                    page_table=p.block_table,
+                    seqused_k=p.seq_lens,
+                    schedule=schedule,
+                    out=out[nd:],
+                    kv_layout="vllm",
+                )
+                return output
+            k_cache, v_cache = kv_cache.split(self.head_size, dim=-1)
             sparse_atten_func(
                 qp,
                 k_cache,
