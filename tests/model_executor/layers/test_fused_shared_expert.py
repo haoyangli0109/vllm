@@ -14,6 +14,7 @@ import torch
 from torch import nn
 
 import vllm.config as vllm_config_module
+import vllm.envs as envs
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.fused_moe import utils as fused_moe_utils
 from vllm.model_executor.layers.fused_moe.layer import determine_expert_counts
@@ -918,6 +919,76 @@ def test_models_fse_init(
 
     importlib.reload(envs)
     rocm_aiter_ops.refresh_env_variables()
+
+
+def _modelopt_mxfp8_config(exclude_modules=(), moe_quant_algo="NVFP4"):
+    from vllm.model_executor.layers.quantization.modelopt import ModelOptMxFp8Config
+
+    return ModelOptMxFp8Config(
+        is_checkpoint_mxfp8_serialized=True,
+        kv_cache_quant_algo=None,
+        exclude_modules=list(exclude_modules),
+        moe_quant_algo=moe_quant_algo,
+    )
+
+
+@pytest.mark.parametrize(
+    ("exclude_modules", "expected"),
+    [
+        ([], True),
+        # MiniMax-M3.1's ignore list: router gates and the vision tower only.
+        (["model.layers.0.mlp.gate", "vision_tower"], True),
+        (["model.layers.0.mlp.shared_experts.down_proj"], False),
+        (["model.layers.0.mlp.experts"], False),
+    ],
+)
+def test_modelopt_mxfp8_shared_expert_fse_compatibility(
+    monkeypatch: pytest.MonkeyPatch, exclude_modules: list[str], expected: bool
+) -> None:
+    """With the NVFP4 routed experts re-quantized to MXFP8 (ROCm default), the
+    MXFP8 shared expert can take an expert slot unless either side is excluded
+    from quantization."""
+    monkeypatch.setattr(current_platform, "is_rocm", lambda: True)
+    monkeypatch.setattr(envs, "VLLM_NVFP4_MOE_REQUANT", "mxfp8", raising=False)
+    compatible, reason = is_shared_expert_quant_fse_compatible(
+        _modelopt_mxfp8_config(exclude_modules),
+        "model.layers.0.mlp.experts",
+        "model.layers.0.mlp.shared_experts",
+    )
+
+    assert compatible is expected
+    assert (reason is None) is expected
+
+
+@pytest.mark.parametrize(
+    ("is_rocm", "requant", "moe_quant_algo", "expected"),
+    [
+        # NVFP4 routed experts elsewhere stay NVFP4, next to an MXFP8 shared expert.
+        (False, "mxfp8", "NVFP4", False),
+        # MXFP4 routed experts would re-quantize the MXFP8 shared expert.
+        (True, "mxfp4", "NVFP4", False),
+        # A plain MXFP8 checkpoint (both sides MXFP8) on any platform.
+        (False, "mxfp8", None, True),
+    ],
+)
+def test_modelopt_mxfp8_shared_expert_fse_keeps_the_stored_format(
+    monkeypatch: pytest.MonkeyPatch,
+    is_rocm: bool,
+    requant: str,
+    moe_quant_algo: str | None,
+    expected: bool,
+) -> None:
+    """The shared expert is fused only in the format it is stored in."""
+    monkeypatch.setattr(current_platform, "is_rocm", lambda: is_rocm)
+    monkeypatch.setattr(envs, "VLLM_NVFP4_MOE_REQUANT", requant, raising=False)
+    compatible, reason = is_shared_expert_quant_fse_compatible(
+        _modelopt_mxfp8_config(moe_quant_algo=moe_quant_algo),
+        "model.layers.0.mlp.experts",
+        "model.layers.0.mlp.shared_experts",
+    )
+
+    assert compatible is expected
+    assert (reason is None) is expected
 
 
 @pytest.mark.parametrize(

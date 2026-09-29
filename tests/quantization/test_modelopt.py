@@ -156,6 +156,10 @@ _M31_QUANT_CONFIG = {
 def test_modelopt_mxfp8_routes_nvfp4_experts_to_compressed_tensors(monkeypatch):
     """MiniMax-M3.1 keeps MXFP8 linears but ships compressed-tensors NVFP4
     routed experts; loading them with the MXFP8 MoE method drops weights."""
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.modelopt.current_platform.is_rocm",
+        lambda: False,
+    )
     ct_method = Mock()
     monkeypatch.setattr(
         "vllm.model_executor.layers.quantization.compressed_tensors."
@@ -172,6 +176,28 @@ def test_modelopt_mxfp8_routes_nvfp4_experts_to_compressed_tensors(monkeypatch):
 
     plain = ModelOptMxFp8Config.from_config({"quant_method": "mxfp8"})
     assert plain.moe_quant_algo is None
+
+
+def test_modelopt_mxfp8_requantizes_nvfp4_experts_on_rocm(monkeypatch):
+    """ROCm has no native NVFP4 MoE backend: the experts are re-quantized to
+    MXFP8 at load instead of being routed to the CT NVFP4 method."""
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.modelopt.current_platform.is_rocm",
+        lambda: True,
+    )
+    mxfp8_method = Mock()
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.modelopt.Nvfp4ExpertsAsMxfp8FusedMoE",
+        mxfp8_method,
+    )
+    config = ModelOptMxFp8Config.from_config(dict(_M31_QUANT_CONFIG))
+    layer = Mock(spec=RoutedExperts)
+    layer.moe_config = Mock()
+    prefix = "model.layers.3.block_sparse_moe.experts"
+    assert config.get_quant_method(layer, prefix) is mxfp8_method.return_value
+    mxfp8_method.assert_called_once_with(
+        quant_config=config, moe_config=layer.moe_config
+    )
 
 
 @pytest.mark.parametrize(

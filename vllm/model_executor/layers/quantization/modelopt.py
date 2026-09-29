@@ -36,6 +36,7 @@ from vllm.model_executor.layers.fused_moe.oracle.fp8 import (
     make_fp8_moe_quant_config,
     select_fp8_moe_backend,
 )
+from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import Mxfp4MoeBackend
 from vllm.model_executor.layers.fused_moe.oracle.mxfp8 import (
     select_mxfp8_moe_backend,
 )
@@ -63,6 +64,10 @@ from vllm.model_executor.layers.quantization.base_config import (
 )
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
+from vllm.model_executor.layers.quantization.online.mxfp4 import (
+    MXFP4_BLOCK_SIZE,
+    Mxfp4OnlineMoEMethod,
+)
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     FP8_SCALE_SENTINEL,
     process_fp8_input_tensor_strategy_moe,
@@ -72,10 +77,15 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
 from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     get_marlin_input_dtype,
 )
+from vllm.model_executor.layers.quantization.utils.mxfp4_utils import mxfp4_quantize
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     MXFP8_BLOCK_SIZE,
     MXFP8_SCALE_DTYPE,
     MXFP8_VALUE_DTYPE,
+    nvfp4_moe_weight_to_mxfp8,
+)
+from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
+    requantize_nvfp4_moe_weight,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     FP4_DTYPE,
@@ -86,6 +96,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8Static128BlockSym,
     kFp8StaticTensorSym,
     kFp8StaticTokenSym,
+    kMxfp4Static,
     kMxfp8Dynamic,
     kMxfp8Static,
     kNvfp4Dynamic,
@@ -106,6 +117,7 @@ from vllm.model_executor.utils import (
     replace_parameter,
     set_weight_attrs,
 )
+from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
 
 if TYPE_CHECKING:
@@ -1232,6 +1244,20 @@ class ModelOptMxFp8Config(ModelOptQuantConfigBase):
             ),
         )
 
+    def routed_expert_weight_key(self) -> QuantKey:
+        """The weight format the routed experts run in.
+
+        MXFP8 as stored, or NVFP4 (``moe_quant_algo: NVFP4``), which ROCm
+        re-quantizes at load: to MXFP8, or MXFP4 with VLLM_NVFP4_MOE_REQUANT.
+        """
+        if self.moe_quant_algo != "NVFP4":
+            return kMxfp8Static
+        if not current_platform.is_rocm():
+            return kNvfp4Static
+        return {"mxfp8": kMxfp8Static, "mxfp4": kMxfp4Static}[
+            envs.VLLM_NVFP4_MOE_REQUANT.lower()
+        ]
+
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> "QuantizeMethodBase | None":
@@ -1240,6 +1266,14 @@ class ModelOptMxFp8Config(ModelOptQuantConfigBase):
             and isinstance(layer, RoutedExperts)
             and not self.is_layer_excluded(prefix)
         ):
+            weight_key = self.routed_expert_weight_key()
+            if weight_key != kNvfp4Static:
+                method_cls = (
+                    Nvfp4ExpertsAsMxfp4FusedMoE
+                    if weight_key == kMxfp4Static
+                    else Nvfp4ExpertsAsMxfp8FusedMoE
+                )
+                return method_cls(quant_config=self, moe_config=layer.moe_config)
             from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a4_nvfp4 import (  # noqa: E501
                 CompressedTensorsW4A4Nvfp4MoEMethod,
             )
@@ -1524,6 +1558,280 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
             shared_experts=shared_experts,
             shared_experts_input=shared_experts_input,
         )
+
+
+class Nvfp4ExpertsAsMxfp8FusedMoE(ModelOptMxFp8FusedMoE):
+    """NVFP4 routed experts of a hybrid MXFP8 checkpoint, run as MXFP8 (ROCm).
+
+    MiniMax-M3.1 style checkpoints (``quant_method: mxfp8`` with
+    ``moe_quant_algo: NVFP4``) store the routed experts as compressed-tensors
+    NVFP4 (``nvfp4-pack-quantized``): packed e2m1 values, one e4m3 scale per 16
+    elements and one fp32 global scale per expert and projection, with gate and
+    up kept apart. ROCm has no native NVFP4 MoE backend, so the experts are
+    converted to MXFP8 once after loading and then run on the MXFP8 MoE kernels
+    with dynamic MXFP8 activations. The conversion re-rounds part of the
+    fp4 x e4m3 products (a few percent relative weight error), and the
+    activations are not NVFP4-quantized as in the checkpoint's recipe.
+
+    The class name must not contain "ModelOpt": RoutedExperts.weight_loader
+    special-cases ModelOpt methods and would load the scalar global scales as
+    weights to shard.
+
+    With shared-expert fusion the layer has extra slots after the routed
+    experts. The checkpoint's shared expert is MXFP8 (e4m3 + e8m0 per 32), so
+    its slots load into separate MXFP8 parameters and are appended after the
+    routed experts are converted.
+    """
+
+    NVFP4_GROUP_SIZE = 16
+
+    def create_weights(
+        self,
+        layer: RoutedExperts,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        assert layer.intermediate_size_per_partition == intermediate_size_per_partition
+        assert layer.hidden_size == hidden_size
+        for name, size in (
+            ("hidden_size", hidden_size),
+            ("intermediate_size_per_partition", intermediate_size_per_partition),
+        ):
+            if size % MXFP8_BLOCK_SIZE != 0:
+                raise ValueError(
+                    f"NVFP4 -> MXFP8 MoE requires {name} divisible by "
+                    f"{MXFP8_BLOCK_SIZE}, got {size}."
+                )
+        layer.orig_dtype = params_dtype
+        layer.num_experts = num_experts
+        w13_num_shards = 2 if self.moe.is_act_and_mul else 1
+        w13_rows = w13_num_shards * intermediate_size_per_partition
+        group = self.NVFP4_GROUP_SIZE
+
+        def add(name, shape, dtype, quant_method=None):
+            param = torch.nn.Parameter(
+                torch.empty(*shape, dtype=dtype), requires_grad=False
+            )
+            layer.register_parameter(name, param)
+            attrs = dict(extra_weight_attrs)
+            if quant_method is not None:
+                attrs["quant_method"] = quant_method.value
+            set_weight_attrs(param, attrs)
+
+        experts, hidden = num_experts, hidden_size
+        inter = intermediate_size_per_partition
+        fp8 = torch.float8_e4m3fn
+        # Two e2m1 values per byte along K.
+        add("w13_weight_packed", (experts, w13_rows, hidden // 2), torch.uint8)
+        add("w2_weight_packed", (experts, hidden, inter // 2), torch.uint8)
+        # One e4m3 scale per 16 elements along K.
+        per_group = FusedMoeWeightScaleSupported.GROUP
+        add("w13_weight_scale", (experts, w13_rows, hidden // group), fp8, per_group)
+        add("w2_weight_scale", (experts, hidden, inter // group), fp8, per_group)
+        # Per-tensor encode scales (dequant factor = 1 / global scale); w13 keeps
+        # [gate, up] apart. The input scales belong to the NVFP4 activation
+        # recipe, which the MXFP8 kernels do not use; they are only loaded.
+        per_tensor = FusedMoeWeightScaleSupported.TENSOR
+        w13_scalar = (experts, w13_num_shards)
+        add("w13_weight_global_scale", w13_scalar, torch.float32, per_tensor)
+        add("w2_weight_global_scale", (experts,), torch.float32, per_tensor)
+        add("w13_input_global_scale", w13_scalar, torch.float32, per_tensor)
+        add("w2_input_global_scale", (experts,), torch.float32, per_tensor)
+
+        # Fused shared-expert slots (ids >= the routed count) arrive as MXFP8
+        # "weight" / "weight_scale". "weight" only exists for these slots;
+        # "weight_scale" collides with the routed NVFP4 scale, so that loader
+        # sends the shared ids to a separate e8m0 parameter.
+        shared = layer.expert_map_manager.num_fused_shared_experts
+        layer.num_routed_slots = experts - shared
+        if not shared:
+            return
+        block = MXFP8_BLOCK_SIZE
+        add("w13_weight", (shared, w13_rows, hidden), fp8)
+        add("w2_weight", (shared, hidden, inter), fp8)
+        add(
+            "w13_shared_weight_scale",
+            (shared, w13_rows, hidden // block),
+            torch.uint8,
+            per_group,
+        )
+        add(
+            "w2_shared_weight_scale",
+            (shared, hidden, inter // block),
+            torch.uint8,
+            per_group,
+        )
+        routed = layer.num_routed_slots
+        load = extra_weight_attrs["weight_loader"]
+
+        def shared_slot_loader(target=None):
+            def loader(
+                param, loaded_weight, weight_name, shard_id, expert_id, **kwargs
+            ):
+                if expert_id < routed:
+                    assert target is not None, weight_name
+                    return load(
+                        param,
+                        loaded_weight,
+                        weight_name,
+                        shard_id=shard_id,
+                        expert_id=expert_id,
+                        **kwargs,
+                    )
+                dest = param if target is None else getattr(layer, target)
+                return load(
+                    dest,
+                    loaded_weight,
+                    weight_name,
+                    shard_id=shard_id,
+                    expert_id=expert_id - routed,
+                    **kwargs,
+                )
+
+            return loader
+
+        layer.w13_weight.weight_loader = shared_slot_loader()
+        layer.w2_weight.weight_loader = shared_slot_loader()
+        layer.w13_weight_scale.weight_loader = shared_slot_loader(
+            "w13_shared_weight_scale"
+        )
+        layer.w2_weight_scale.weight_loader = shared_slot_loader(
+            "w2_shared_weight_scale"
+        )
+
+    def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+        if getattr(layer, "_already_called_process_weights_after_loading", False):
+            return
+
+        routed = layer.num_routed_slots
+        w13, w13_scale = nvfp4_moe_weight_to_mxfp8(
+            layer.w13_weight_packed[:routed],
+            layer.w13_weight_scale[:routed],
+            1.0 / layer.w13_weight_global_scale[:routed],
+        )
+        w2, w2_scale = nvfp4_moe_weight_to_mxfp8(
+            layer.w2_weight_packed[:routed],
+            layer.w2_weight_scale[:routed],
+            (1.0 / layer.w2_weight_global_scale[:routed]).unsqueeze(1),
+        )
+        if routed < layer.num_experts:
+            # Fused shared-expert slots, already MXFP8.
+            w13 = torch.cat([w13, layer.w13_weight.data])
+            w2 = torch.cat([w2, layer.w2_weight.data])
+            w13_scale = torch.cat([w13_scale, layer.w13_shared_weight_scale.data])
+            w2_scale = torch.cat([w2_scale, layer.w2_shared_weight_scale.data])
+            delattr(layer, "w13_shared_weight_scale")
+            delattr(layer, "w2_shared_weight_scale")
+        for name in (
+            "w13_weight_packed",
+            "w2_weight_packed",
+            "w13_weight_global_scale",
+            "w2_weight_global_scale",
+            "w13_input_global_scale",
+            "w2_input_global_scale",
+        ):
+            delattr(layer, name)
+        replace_parameter(layer, "w13_weight", w13)
+        replace_parameter(layer, "w2_weight", w2)
+        replace_parameter(layer, "w13_weight_scale", w13_scale)
+        replace_parameter(layer, "w2_weight_scale", w2_scale)
+
+        super().process_weights_after_loading(layer)
+
+
+class Nvfp4ExpertsAsMxfp4FusedMoE(Mxfp4OnlineMoEMethod):
+    """NVFP4 routed experts re-quantized to MXFP4 (VLLM_NVFP4_MOE_REQUANT=mxfp4).
+
+    Keeps the experts at 4 bits (half the memory of MXFP8) and runs them on the
+    MXFP4 MoE kernels with MXFP4 activations. The power-of-two MXFP4 scales
+    cannot hold the e4m3 block scales, so the values are rounded to the e2m1
+    grid a second time: the weight error is of the order of the NVFP4
+    quantization error itself.
+
+    Loading is the same as Nvfp4ExpertsAsMxfp8FusedMoE. The shared expert is
+    not fused: it stays MXFP8, as stored.
+    """
+
+    NVFP4_GROUP_SIZE = Nvfp4ExpertsAsMxfp8FusedMoE.NVFP4_GROUP_SIZE
+
+    def __init__(
+        self,
+        quant_config: ModelOptMxFp8Config,
+        moe_config: FusedMoEConfig,
+    ) -> None:
+        super().__init__(moe=moe_config)
+        self.quant_config = quant_config
+
+    def create_weights(
+        self,
+        layer: RoutedExperts,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        Nvfp4ExpertsAsMxfp8FusedMoE.create_weights(
+            self,  # type: ignore[arg-type]
+            layer,
+            num_experts,
+            hidden_size,
+            intermediate_size_per_partition,
+            params_dtype,
+            **extra_weight_attrs,
+        )
+        # A backend may pad the sizes beyond the checkpoint's; the padding must
+        # dequantize to zero.
+        for name, param in layer.named_parameters(recurse=False):
+            if name.startswith(("w13_", "w2_")):
+                param.data.zero_()
+        layer.weight_block_size = [1, MXFP4_BLOCK_SIZE]
+
+    def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+        if getattr(layer, "_already_called_process_weights_after_loading", False):
+            return
+        if self.mxfp4_backend == Mxfp4MoeBackend.NONE:
+            raise ValueError(
+                "VLLM_NVFP4_MOE_REQUANT=mxfp4 needs an MXFP4 MoE backend, and "
+                "none is available on this platform."
+            )
+
+        routed = layer.num_routed_slots
+        # No fused shared-expert slots: the shared expert stays MXFP8, as stored
+        # (is_shared_expert_quant_fse_compatible refuses the fusion).
+        assert routed == layer.num_experts, (routed, layer.num_experts)
+        w13, w13_scale = requantize_nvfp4_moe_weight(
+            layer.w13_weight_packed[:routed],
+            layer.w13_weight_scale[:routed],
+            1.0 / layer.w13_weight_global_scale[:routed],
+            mxfp4_quantize,
+            torch.bfloat16,
+        )
+        w2, w2_scale = requantize_nvfp4_moe_weight(
+            layer.w2_weight_packed[:routed],
+            layer.w2_weight_scale[:routed],
+            (1.0 / layer.w2_weight_global_scale[:routed]).unsqueeze(1),
+            mxfp4_quantize,
+            torch.bfloat16,
+        )
+        for name in (
+            "w13_weight_packed",
+            "w2_weight_packed",
+            "w13_weight_scale",
+            "w2_weight_scale",
+            "w13_weight_global_scale",
+            "w2_weight_global_scale",
+            "w13_input_global_scale",
+            "w2_input_global_scale",
+        ):
+            delattr(layer, name)
+        layer.w13_input_scale = None
+        layer.w2_input_scale = None
+        self._setup_kernel(layer, w13, w2, w13_scale, w2_scale, None, None)
+        layer._already_called_process_weights_after_loading = True
 
 
 # Register the method classes for ModelOptMxFp8Config

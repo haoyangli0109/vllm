@@ -243,6 +243,69 @@ def dequant_mxfp8_to_bf16(x: torch.Tensor, scales: torch.Tensor) -> torch.Tensor
     return dequantized.to(torch.bfloat16)
 
 
+@torch.no_grad()
+def nvfp4_moe_weight_to_mxfp8(
+    weight_packed: torch.Tensor,
+    weight_scale: torch.Tensor,
+    dequant_scale: torch.Tensor,
+    chunk_bytes: int = 1 << 30,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Convert an NVFP4 MoE weight to MXFP8.
+
+    The values are dequantized in fp32 and re-quantized with one e8m0 scale per
+    32 elements. The e2m1 x e4m3 products need up to five significant bits, so
+    those that do not fit e4m3's four are rounded: the result is close to, not
+    equal to, the NVFP4 weight.
+
+    Args:
+        weight_packed: uint8 [E, N, K // 2], two e2m1 values per byte.
+        weight_scale: float8_e4m3fn [E, N, K // 16] block scales.
+        dequant_scale: float32 [E, S] per-tensor dequant factors, one for each
+            of S equal row shards of N (S = 2 for a gate/up weight whose gate
+            and up halves carry separate global scales).
+        chunk_bytes: bound on the fp32 staging tensor.
+
+    Returns:
+        (float8_e4m3fn [E, N, K], uint8 e8m0 scales [E, N, K // 32]).
+
+    """
+    from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
+        dequantize_to_dtype,
+    )
+
+    num_experts, n, half_k = weight_packed.shape
+    k = half_k * 2
+    num_shards = dequant_scale.shape[1]
+    assert n % num_shards == 0, (n, num_shards)
+    rows = n // num_shards
+
+    out = torch.empty(
+        (num_experts, n, k), dtype=MXFP8_VALUE_DTYPE, device=weight_packed.device
+    )
+    out_scale = torch.empty(
+        (num_experts, n, k // MXFP8_BLOCK_SIZE),
+        dtype=MXFP8_SCALE_DTYPE,
+        device=weight_packed.device,
+    )
+    experts_per_chunk = max(1, chunk_bytes // (rows * k * 4))
+    for s in range(num_shards):
+        r = slice(s * rows, (s + 1) * rows)
+        for e0 in range(0, num_experts, experts_per_chunk):
+            e = slice(e0, min(e0 + experts_per_chunk, num_experts))
+            w = dequantize_to_dtype(
+                weight_packed[e, r],
+                weight_scale[e, r],
+                dequant_scale[e, s].contiguous(),
+                torch.float32,
+                block_size=16,
+                swizzle=False,
+            )
+            q, q_scale = mxfp8_e4m3_quantize(w.reshape(-1, k))
+            out[e, r] = q.view(-1, rows, k)
+            out_scale[e, r] = q_scale.view(-1, rows, k // MXFP8_BLOCK_SIZE)
+    return out, out_scale
+
+
 def mxfp8_e4m3_quantize_fake(
     x: torch.Tensor,
     is_sf_swizzled_layout: bool = False,

@@ -72,11 +72,42 @@ def is_shared_expert_quant_fse_compatible(
         return True, None
 
     from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+    from vllm.model_executor.layers.quantization.modelopt import ModelOptMxFp8Config
     from vllm.model_executor.layers.quantization.quark.quark import QuarkConfig
     from vllm.model_executor.layers.quantization.utils.quant_utils import (
         is_layer_skipped,
     )
     from vllm.models.deepseek_v4.quant_config import DeepseekV4FP8Config
+
+    if isinstance(quant_config, ModelOptMxFp8Config):
+        from vllm.model_executor.layers.quantization.utils.quant_utils import (
+            kMxfp8Static,
+        )
+
+        # The shared expert is stored as MXFP8; it can take an expert slot only
+        # when the routed experts run in that same format, and neither side is
+        # excluded from quantization.
+        if quant_config.routed_expert_weight_key() != kMxfp8Static:
+            return (
+                False,
+                "routed experts do not run as MXFP8 like the shared expert at "
+                f"{shared_expert_prefix}",
+            )
+        shared_projection_prefixes = [
+            f"{shared_expert_prefix}.{projection_name}"
+            for projection_name in projection_names
+        ]
+        excluded = [
+            prefix
+            for prefix in (expert_prefix, *shared_projection_prefixes)
+            if quant_config.is_layer_excluded(prefix)
+        ]
+        if excluded:
+            return (
+                False,
+                "ModelOpt MXFP8 excludes fused expert modules: " + ", ".join(excluded),
+            )
+        return True, None
 
     if isinstance(quant_config, DeepseekV4FP8Config):
         from vllm.config import get_current_vllm_config
