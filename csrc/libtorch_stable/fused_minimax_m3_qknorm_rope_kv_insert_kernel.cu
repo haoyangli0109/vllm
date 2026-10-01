@@ -285,33 +285,59 @@ __device__ __forceinline__ void storeScaledQElemsFp8(
   storeElemsFp8(dst, scaled);
 }
 
+// index_q: E4M3(scalar_t(v)) with unit scale, i.e. q is rounded to the model
+// dtype before the fp8 cast. On CUDA each element pair is rounded to scalar_t
+// and then converted to E4M3, with one packed cvt each.
+template <typename scalar_t>
+__device__ __forceinline__ void storeIndexQElemsFp8(
+    uint8_t* __restrict__ dst, float const (&elems)[kElemsPerLane]) {
+#ifndef USE_ROCM
+  using Converter = vllm::_typeConvert<scalar_t>;
+  __nv_fp8x2_storage_t out2[kElemsPerLane / 2];
+  #pragma unroll
+  for (int i = 0; i < kElemsPerLane / 2; i++) {
+    auto const v =
+        Converter::convert(make_float2(elems[2 * i], elems[2 * i + 1]));
+    if constexpr (std::is_same_v<scalar_t, c10::BFloat16>) {
+      out2[i] = __nv_cvt_bfloat16raw2_to_fp8x2(v, __NV_SATFINITE, __NV_E4M3);
+    } else {
+      out2[i] = __nv_cvt_halfraw2_to_fp8x2(v, __NV_SATFINITE, __NV_E4M3);
+    }
+  }
+  *reinterpret_cast<uint32_t*>(dst) = *reinterpret_cast<uint32_t const*>(out2);
+#else
+  storeScaledQElemsFp8<scalar_t>(dst, elems, 1.0f);
+#endif
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // NVFP4 main K/V cache store
 // ────────────────────────────────────────────────────────────────────────────
-// Byte-for-byte the layout and scale math of reshape_and_cache_nvfp4_kernel
-// (nvfp4_kv_cache_kernels.cu), so the MSA and FlashInfer NVFP4 readers accept
-// it. Each HND page is [K side | V side]; a side is every head's packed E2M1
-// data [nkv, bs, 64] followed by its E4M3 block scales [nkv, bs, 8]. K scales
-// are linear, V scales use the SM100 trtllm-gen 4x4 token-quad swizzle. One
+// The block encoding of reshape_and_cache_nvfp4_kernel
+// (nvfp4_kv_cache_kernels.cu) in the MSA readers' head-slot page layout. The
+// quantizer differs from that kernel's reciprocal-multiply math: per 16-value
+// block, scale = min(448, max(E4M3(max(amax, 1e-12) / 6), 1/512)) and
+// code = sign | RNE-E2M1(min(|x / scale|, 6)), with zero stored as +0, all on
+// x / the global scale.
+// An HND page is 2*nkv slots of [bs, 72] bytes; slot 2*head + side (K = 0,
+// V = 1) holds that head's packed E2M1 data [bs, 64] followed by its E4M3 block
+// scales [bs, 8]. Every head is one contiguous 2*bs*72-byte run, so a page
+// split across TP ranks is a contiguous byte slice per rank. K scales are
+// linear, V scales use the SM100 trtllm-gen 4x4 token-quad swizzle. One
 // 16-element scale group is four lanes. SM100-family builds of this file
 // (CMake gives it family-specific SM10x/11x targets) encode E2M1 with
 // cvt.rn.satfinite.e2m1x2; other targets use a bit-exact software encoder.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000 && \
+    defined(__CUDA_ARCH_FAMILY_SPECIFIC__)
+  #define MINIMAX_M3_NVFP4_NATIVE_CVT 1
+#else
+  #define MINIMAX_M3_NVFP4_NATIVE_CVT 0
+#endif
+
 #ifndef USE_ROCM
-  #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000 && \
-      defined(__CUDA_ARCH_FAMILY_SPECIFIC__)
-    #define MINIMAX_M3_NVFP4_NATIVE_CVT 1
-  #else
-    #define MINIMAX_M3_NVFP4_NATIVE_CVT 0
-  #endif
 constexpr int kNvfp4DataBytes = kHeadDim / 2;            // 64
 constexpr int kNvfp4ScaleBytes = kHeadDim / 16;          // 8
 constexpr int kNvfp4LanesPerGroup = 16 / kElemsPerLane;  // 4
-
-__device__ __forceinline__ float rcpApproxFtz(float a) {
-  float b;
-  asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(b) : "f"(a));
-  return b;
-}
 
 // Round-to-nearest-even, saturating E2M1 code of ``x`` (matches
 // cvt.rn.satfinite.e2m1x2.f32). Below 1 the grid is the 0.5-step subnormals;
@@ -330,27 +356,82 @@ __device__ __forceinline__ uint32_t e2m1Code(float x) {
   return mag | ((__float_as_uint(x) >> 28) & 0x8u);
 }
 
-// (helpers above and the NVFP4 store below are CUDA-only)
-// E4M3 block scale for a group whose largest magnitude maps to 6, and the
-// factor that takes a value to its E2M1 code.
+__device__ __forceinline__ float rcpApproxFtz(float a) {
+  float b;
+  asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(b) : "f"(a));
+  return b;
+}
+
+// a / b rounded to nearest even from r = RN(1 / b): Markstein's correction of
+// a * r, which is __fdiv_rn's fast path without its range-check branch. Exact
+// unless a * r overflows or the residual a - q * b underflows (a within a few
+// binades of the subnormals).
+__device__ __forceinline__ float divRnByRcp(float a, float b, float r) {
+  float const q = __fmul_rn(a, r);
+  return __fmaf_rn(__fmaf_rn(-q, b, a), r, q);
+}
+
+// Block scale E4M3(max(amax, 1e-12) / 6) clamped to [1/512, 448], with
+// sf_scale applied to it as to the values, and its reciprocal RN(1 / sf_value).
 __device__ __forceinline__ void nvfp4GroupScale(float sf_scale, float group_max,
                                                 uint8_t& sf_byte,
-                                                float& quant_scale) {
-  __nv_fp8_e4m3 const sf(sf_scale * (group_max * rcpApproxFtz(6.0f)));
-  sf_byte = reinterpret_cast<uint8_t const&>(sf);
-  float const sf_value = float(sf);
-  quant_scale =
-      sf_value != 0.0f ? rcpApproxFtz(sf_value * rcpApproxFtz(sf_scale)) : 0.0f;
+                                                float& sf_value,
+                                                float& sf_rcp) {
+  constexpr float kRcp6 = 0x1.555556p-3f;  // RN(1 / 6)
+  float const amax = fmaxf(group_max, 1e-12f);
+  // amax / 6 (RNE). amax * kRcp6 bounds it from above, and fminf picks it for
+  // amax = inf, where the correction is NaN.
+  float const amax_6 =
+      fminf(divRnByRcp(amax, 6.0f, kRcp6), __fmul_rn(amax, kRcp6));
+  // Flooring before the rounding gives the 1/512 minimum; satfinite caps it
+  // at 448.
+  __nv_fp8_e4m3 const sf(fmaxf(sf_scale * amax_6, 0x1p-9f));
+  sf_byte = sf.__x;
+  sf_value = float(sf);
+  // rcp.approx is correctly rounded on every positive E4M3 value.
+  sf_rcp = rcpApproxFtz(sf_value);
+}
+
+// nvfp4GroupScale for sf_scale = 1 and a bf16/fp16 group_max. Uncorrected,
+// amax * RN(1 / 6) still rounds to the E4M3 byte of amax / 6 (checked for every
+// such amax: amax / 6 is too far from an E4M3 rounding boundary to cross it,
+// and exact ties round back), and the 1e-12 floor lies below the 1/512 one.
+__device__ __forceinline__ void nvfp4UnitGroupScale(float group_max,
+                                                    uint8_t& sf_byte,
+                                                    float& sf_rcp) {
+  constexpr float kRcp6 = 0x1.555556p-3f;  // RN(1 / 6)
+  __nv_fp8_e4m3 const sf(fmaxf(__fmul_rn(group_max, kRcp6), 0x1p-9f));
+  sf_byte = sf.__x;
+  sf_rcp = rcpApproxFtz(float(sf));
+}
+
+// (x * sf_scale) / sf_value with the E2M1 code of the IEEE quotient. The
+// quotient itself is the IEEE one except below 1e-35 (code 0 either way) and
+// for magnitudes over 4096, which are clamped (NaN kept) so that the division
+// stays finite: 4096 / 448 > 5, so their code stays the saturated 6.
+__device__ __forceinline__ float nvfp4Quotient(float x, float sf_scale,
+                                               float sf_value, float sf_rcp) {
+  constexpr float kMaxMag = 4096.0f;
+  float n = __fmul_rn(x, sf_scale);
+  n = fabsf(n) > kMaxMag ? copysignf(kMaxMag, n) : n;
+  return divRnByRcp(n, sf_value, sf_rcp);
+}
+
+// Zero is stored as +0: clear the sign of every nibble whose magnitude is 0.
+// Adding 7 to a 3-bit magnitude carries into the sign bit exactly when it is
+// nonzero.
+__device__ __forceinline__ uint16_t clearNegZeroNibbles(uint16_t packed) {
+  return packed & (((packed & 0x7777u) + 0x7777u) | 0x7777u);
 }
 
 // Quantize one K or V head row of one token into its NVFP4 page, where
-// ``sf_scale`` is 1 / the dequantization (global) scale. Every lane of the
-// warp must call this (the scale-group reductions shuffle).
+// ``scale`` is the dequantization (global) scale. Every lane of the warp must
+// call this (the scale-group reductions shuffle).
 template <typename scalar_t>
 __device__ __forceinline__ void storeNvfp4CacheElems(
     uint8_t* __restrict__ page, int const kv, int const head, int const token,
-    int const nkv, int const block_size, int const laneId,
-    float const (&elems)[kElemsPerLane], float const sf_scale) {
+    int const block_size, int const laneId, float const (&elems)[kElemsPerLane],
+    float const scale) {
   // Quantize the model-dtype value that the unfused path reads back from qkv.
   using Converter = vllm::_typeConvert<scalar_t>;
   float x[kElemsPerLane];
@@ -364,9 +445,60 @@ __device__ __forceinline__ void storeNvfp4CacheElems(
   group_max = fmaxf(group_max, __shfl_xor_sync(FINAL_MASK, group_max, 2, 32));
 
   uint8_t sf_byte;
-  float quant_scale;
-  nvfp4GroupScale(sf_scale, group_max, sf_byte, quant_scale);
-
+  float sf_rcp;
+  float q[kElemsPerLane];  // (x / scale) / sf_value, E2M1-encoded below
+  if (scale == 1.0f) {
+    static_assert(sizeof(scalar_t) == 2, "the unit-scale path needs bf16/fp16");
+    nvfp4UnitGroupScale(group_max, sf_byte, sf_rcp);
+    // x / sf_value truncated from x * RN(1 / sf_value). RN(1 / s) >= 1 / s for
+    // every E4M3 s, so a bf16/fp16 x on an E2M1 midpoint lands exactly on it
+    // (and the cvt rounds it to even), while any other bf16/fp16 x is too far
+    // from a midpoint to reach one. No clamp either: a finite product never
+    // truncates to inf, and inf saturates in the cvt.
+  #if MINIMAX_M3_NVFP4_NATIVE_CVT
+    float2 const r2 = make_float2(sf_rcp, sf_rcp);
+    #pragma unroll
+    for (int i = 0; i < kElemsPerLane; i += 2) {
+      float2 const p = __fmul2_rz(make_float2(x[i], x[i + 1]), r2);
+      q[i] = p.x;
+      q[i + 1] = p.y;
+    }
+  #else
+    #pragma unroll
+    for (int i = 0; i < kElemsPerLane; i++) q[i] = __fmul_rz(x[i], sf_rcp);
+  #endif
+  } else {
+    float const sf_scale = __frcp_rn(scale);  // exactly 1.0f / scale
+    float sf_value;
+    nvfp4GroupScale(sf_scale, group_max, sf_byte, sf_value, sf_rcp);
+    // A correctly rounded division, not a reciprocal multiply, so that exact
+    // E2M1 midpoints round to even.
+  #if MINIMAX_M3_NVFP4_NATIVE_CVT
+    // nvfp4Quotient on element pairs, with SM100's packed FP32 instructions.
+    float2 const s2 = make_float2(sf_scale, sf_scale);
+    float2 const neg_v2 = make_float2(-sf_value, -sf_value);
+    float2 const r2 = make_float2(sf_rcp, sf_rcp);
+    #pragma unroll
+    for (int i = 0; i < kElemsPerLane; i += 2) {
+      float2 n = __fmul2_rn(make_float2(x[i], x[i + 1]), s2);
+      // |n| <= 4096 as in nvfp4Quotient, NaN kept.
+      asm("max.NaN.f32 %0, %0, 0fC5800000;\n\t"
+          "min.NaN.f32 %0, %0, 0f45800000;\n\t"
+          "max.NaN.f32 %1, %1, 0fC5800000;\n\t"
+          "min.NaN.f32 %1, %1, 0f45800000;"
+          : "+f"(n.x), "+f"(n.y));
+      float2 const q0 = __fmul2_rn(n, r2);
+      float2 const p = __ffma2_rn(__ffma2_rn(q0, neg_v2, n), r2, q0);
+      q[i] = p.x;
+      q[i + 1] = p.y;
+    }
+  #else
+    #pragma unroll
+    for (int i = 0; i < kElemsPerLane; i++) {
+      q[i] = nvfp4Quotient(x[i], sf_scale, sf_value, sf_rcp);
+    }
+  #endif
+  }
   uint16_t packed;
   #if MINIMAX_M3_NVFP4_NATIVE_CVT
   // Low nibble = even element; cvt packs its first source in the high nibble.
@@ -377,24 +509,20 @@ __device__ __forceinline__ void storeNvfp4CacheElems(
       "  mov.b16 %0, {lo, hi};\n"
       "}"
       : "=h"(packed)
-      : "f"(x[0] * quant_scale), "f"(x[1] * quant_scale),
-        "f"(x[2] * quant_scale), "f"(x[3] * quant_scale));
+      : "f"(q[0]), "f"(q[1]), "f"(q[2]), "f"(q[3]));
   #else
   uint32_t codes = 0;
     #pragma unroll
-  for (int i = 0; i < kElemsPerLane; i++) {
-    codes |= e2m1Code(x[i] * quant_scale) << (4 * i);
-  }
+  for (int i = 0; i < kElemsPerLane; i++) codes |= e2m1Code(q[i]) << (4 * i);
   packed = static_cast<uint16_t>(codes);
   #endif
+  packed = clearNegZeroNibbles(packed);
 
-  int64_t const side_bytes = static_cast<int64_t>(nkv) * block_size *
-                             (kNvfp4DataBytes + kNvfp4ScaleBytes);
-  uint8_t* const side = page + kv * side_bytes;
+  uint8_t* const slot = page + static_cast<int64_t>(2 * head + kv) *
+                                   block_size *
+                                   (kNvfp4DataBytes + kNvfp4ScaleBytes);
   uint8_t* const data =
-      side +
-      (static_cast<int64_t>(head) * block_size + token) * kNvfp4DataBytes +
-      laneId * (kElemsPerLane / 2);
+      slot + token * kNvfp4DataBytes + laneId * (kElemsPerLane / 2);
   *reinterpret_cast<uint16_t*>(data) = packed;
 
   if (laneId % kNvfp4LanesPerGroup == 0) {
@@ -408,9 +536,7 @@ __device__ __forceinline__ void storeNvfp4CacheElems(
       int const swizzled_s = (group % kGroupsPerQuad) * 4 + token % 4;
       offset = swizzled_t * kNvfp4ScaleBytes + swizzled_s;
     }
-    side[static_cast<int64_t>(nkv) * block_size * kNvfp4DataBytes +
-         static_cast<int64_t>(head) * block_size * kNvfp4ScaleBytes + offset] =
-        sf_byte;
+    slot[block_size * kNvfp4DataBytes + offset] = sf_byte;
   }
 }
 #endif  // USE_ROCM
@@ -484,8 +610,11 @@ __global__ void fusedMiniMaxM3QNormRopeKVInsertKernel(
     int const idx_slots = kProcessIndex ? niq + 1 : 0;
     int const slots_per_token = nq + nkv + v_slots + idx_slots;
 
-    int const tokenIdx = globalWarpIdx / slots_per_token;
-    int const slot = globalWarpIdx % slots_per_token;
+    // Unsigned: both are non-negative, and the signed division's sign handling
+    // would cost every warp.
+    unsigned const warp_u = globalWarpIdx, slots_u = slots_per_token;
+    int const tokenIdx = warp_u / slots_u;
+    int const slot = warp_u % slots_u;
     if (tokenIdx >= num_tokens) return;
 
     // Slot boundaries.
@@ -552,10 +681,13 @@ __global__ void fusedMiniMaxM3QNormRopeKVInsertKernel(
     // flat TMA descriptor can address them as [tokens*heads, head_dim]; this
     // folds the de-interleaving into the store the kernel already does, instead
     // of a separate q.contiguous() copy.  Everything else stays in place.
+    // Given q_fp8_out but no q_out, q is emitted only in fp8 (null store_ptr).
     scalar_t* store_ptr = row_ptr;
     if (isQ && q_out != nullptr) {
       store_ptr = q_out + static_cast<int64_t>(tokenIdx) * nq * kHeadDim +
                   slot * kHeadDim;
+    } else if (isQ && q_fp8_out != nullptr) {
+      store_ptr = nullptr;
     } else if (isIQ && index_q_out != nullptr) {
       // bf16 index_q_out: gather here. fp8: written by the explicit fp8 store.
       if constexpr (!kFp8Idx) {
@@ -566,12 +698,10 @@ __global__ void fusedMiniMaxM3QNormRopeKVInsertKernel(
     }
 
     // NVFP4: the per-layer global scale is not produced by the predecessor,
-    // so load it before the PDL wait. __frcp_rn is exactly 1.0f / scale.
-    float nvfp4_sf_scale = 0.0f;
+    // so load it before the PDL wait.
+    float nvfp4_scale = 0.0f;
     if constexpr (kNvfp4) {
-      if (isK || isV) {
-        nvfp4_sf_scale = __frcp_rn(isK ? *kv_k_scale : *kv_v_scale);
-      }
+      if (isK || isV) nvfp4_scale = isK ? *kv_k_scale : *kv_v_scale;
     }
 
     // PDL: wait for the predecessor kernel (the qkv-projection GEMM that
@@ -592,16 +722,17 @@ __global__ void fusedMiniMaxM3QNormRopeKVInsertKernel(
       normAndRope<scalar_t>(elems, laneId, eps, norm_w, do_rope, rotary_dim,
                             cos_ptr, /*apply_norm=*/norm_w != nullptr);
       if constexpr (kFp8Idx) {
-        // index_q is e4m3 bytes; Q/K (and in-place index_k) stay scalar_t.
+        // index_q is E4M3(scalar_t(q)) bytes; Q/K (and in-place index_k) stay
+        // scalar_t.
         if (isIQ && index_q_out != nullptr) {
-          storeElemsFp8(index_q_out +
-                            static_cast<int64_t>(tokenIdx) * niq * kHeadDim +
-                            (slot - iq_begin) * kHeadDim + dim_base,
-                        elems);
-        } else {
+          storeIndexQElemsFp8<scalar_t>(
+              index_q_out + static_cast<int64_t>(tokenIdx) * niq * kHeadDim +
+                  (slot - iq_begin) * kHeadDim + dim_base,
+              elems);
+        } else if (store_ptr != nullptr) {
           storeElems<scalar_t>(store_ptr + dim_base, elems);
         }
-      } else {
+      } else if (store_ptr != nullptr) {
         storeElems<scalar_t>(store_ptr + dim_base, elems);
       }
       if (isQ && q_fp8_out != nullptr) {
@@ -630,13 +761,13 @@ __global__ void fusedMiniMaxM3QNormRopeKVInsertKernel(
           }
         } else if constexpr (kNvfp4) {
 #ifndef USE_ROCM
-          // kv_cache is [num_blocks, 2*nkv, block_size, 72] bytes (HND);
-          // kv_s_block is its page stride.
+          // kv_cache is [num_blocks, 2*nkv, block_size, 72] bytes (HND), slot
+          // 2*head + side; kv_s_block is its page stride.
           storeNvfp4CacheElems<scalar_t>(
               reinterpret_cast<uint8_t*>(kv_cache) +
                   (sm / block_size) * kv_s_block,
-              isK ? 0 : 1, head, static_cast<int>(sm % block_size), nkv,
-              block_size, laneId, elems, nvfp4_sf_scale);
+              isK ? 0 : 1, head, static_cast<int>(sm % block_size), block_size,
+              laneId, elems, nvfp4_scale);
 #endif
         } else if (isK || isV) {
           // kv_cache logical shape [num_blocks, nkv, block_size, 2*head_dim].
@@ -966,8 +1097,8 @@ void fused_minimax_m3_qknorm_rope_kv_insert(
                     "kv_cache must be [nb,nkv,bs,2*head_dim] with contiguous "
                     "content dim (stride(3)==1)");
     if (nvfp4_kv) {
-      // Packed HND pages [nb, 2*nkv, bs, 72]: every (side, head) block is
-      // contiguous inside the page, which the store addresses directly.
+      // Packed HND pages [nb, 2*nkv, bs, 72]: slot 2*head + side is one
+      // contiguous [bs, 72] block, which the store addresses directly.
       int64_t const full_dim = kHeadDim / 2 + kHeadDim / 16;
       STD_TORCH_CHECK(
           kv_cache->size(1) == 2 * nkv && kv_cache->size(2) == block_size &&

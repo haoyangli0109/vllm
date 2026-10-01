@@ -34,6 +34,7 @@ from vllm.models.minimax_m3.nvidia.msa_cutlass_sparse_decode import (
     MSACutlassDecodePlanCache,
     is_nvfp4_kv_cache,
     msa_cutlass_sparse_decode,
+    nvfp4_kv_cache_views,
     prepare_decode_metadata,
     should_prepare_decode_metadata,
     supports_cutlass_sparse_decode,
@@ -47,28 +48,15 @@ from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayout
 
 logger = init_logger(__name__)
 
-# Per KV side of a HND NVFP4 page: all heads' packed E2M1 data, then all heads'
-# E4M3 block scales (see ``nvfp4_split_data_scale``).
-_NVFP4_DATA_BYTES_PER_HEAD = SPARSE_BLOCK_SIZE * 64
-_NVFP4_SCALE_BYTES_PER_HEAD = SPARSE_BLOCK_SIZE * 8
 
-
-def _nvfp4_data_scale_views(
-    kv_side: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Split one ``[pages, Hkv, 128, 72]`` side into data and scale views."""
-    pages, heads = kv_side.shape[:2]
-    page_stride = kv_side.stride(0)
-    data = kv_side.as_strided(
-        (pages, heads, SPARSE_BLOCK_SIZE, 64),
-        (page_stride, _NVFP4_DATA_BYTES_PER_HEAD, 64, 1),
-    )
-    scale = kv_side.as_strided(
-        (pages, heads, SPARSE_BLOCK_SIZE, 8),
-        (page_stride, _NVFP4_SCALE_BYTES_PER_HEAD, 8, 1),
-        kv_side.storage_offset() + heads * _NVFP4_DATA_BYTES_PER_HEAD,
-    )
-    return data, scale
+def _dequantize_query(
+    query_fp8: torch.Tensor, q_scale: float, out: torch.Tensor
+) -> torch.Tensor:
+    """Write ``query_fp8 * q_scale`` into ``out`` (E4M3 is exact in BF16)."""
+    out.copy_(query_fp8)
+    if q_scale != 1.0:
+        out.mul_(q_scale)
+    return out
 
 
 class MiniMaxM3SparseMSABackend(MiniMaxM3SparseBackend):
@@ -80,13 +68,14 @@ class MiniMaxM3SparseMSABackend(MiniMaxM3SparseBackend):
 
 
 class MiniMaxM3SparseMSANvfp4Backend(MiniMaxM3SparseMSABackend):
-    """MSA backend over vLLM's HND NVFP4 KV cache pages."""
+    """MSA backend over HND NVFP4 KV cache pages in per-head K/V slots."""
 
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = ["nvfp4"]
 
     @classmethod
     def customize_spec(cls, spec: AttentionSpec) -> AttentionSpec:
-        """Store K and V as separate head slots of packed data + block scales."""
+        """Store each head's K and V as two slots of packed data + block scales
+        (see ``nvfp4_kv_cache_views``)."""
         if spec.state_content_bytes is not None or not spec.kv_quant_mode.is_nvfp4:
             return spec
         return replace(
@@ -98,7 +87,7 @@ class MiniMaxM3SparseMSANvfp4Backend(MiniMaxM3SparseMSABackend):
 
     @classmethod
     def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...] | None:
-        # The MSA NVFP4 readers assume head-major data and scale regions.
+        # Every head's K/V slots are one contiguous run of the page.
         return (KVCacheLayout.LBHNC,)
 
 
@@ -276,6 +265,15 @@ class MiniMaxM3SparseMSAImpl(MiniMaxM3SparseImpl):
         hd = self.head_size
         q = query[:num_tokens].view(-1, self.num_heads, hd)
         out = output[:num_tokens].view(-1, self.num_heads, hd)
+        # Given query_fp8, it is the only q the fused insert wrote: CUTLASS
+        # decode reads it directly, and the bf16-query kernels read it
+        # dequantized into ``query``.
+        q_fp8 = (
+            None
+            if query_fp8 is None
+            else query_fp8[:num_tokens].view(-1, self.num_heads, hd)
+        )
+        q_scale_float = getattr(layer, "_q_scale_float", 1.0)
         if self.use_fp8_kv and not self.use_nvfp4_kv:
             kv_cache = kv_cache.view(self.kv_cache_fp8_dtype)
         k_scale = getattr(layer, "_k_scale", None) if self.use_fp8_kv else None
@@ -291,15 +289,15 @@ class MiniMaxM3SparseMSAImpl(MiniMaxM3SparseImpl):
                 else None
             )
             if self.use_cutlass_decode and msa_metadata is not None:
-                assert query_fp8 is not None
+                assert q_fp8 is not None
                 msa_cutlass_sparse_decode(
-                    query_fp8[:nd].view(-1, self.num_heads, hd),
+                    q_fp8[:nd],
                     kv_cache,
                     topk[:nd],
                     out[:nd],
                     msa_metadata,
                     scale=self.scale,
-                    q_scale_float=getattr(layer, "_q_scale_float", 1.0),
+                    q_scale_float=q_scale_float,
                     k_scale_float=getattr(layer, "_k_scale_float", 1.0),
                     v_scale_float=getattr(layer, "_v_scale_float", 1.0),
                     k_scale=k_scale if self.use_nvfp4_kv else None,
@@ -313,7 +311,9 @@ class MiniMaxM3SparseMSAImpl(MiniMaxM3SparseImpl):
                 )
             else:
                 minimax_m3_sparse_attn_decode(
-                    q[:nd],
+                    q[:nd]
+                    if q_fp8 is None
+                    else _dequantize_query(q_fp8[:nd], q_scale_float, q[:nd]),
                     kv_cache,
                     topk[:nd].transpose(0, 1),
                     d.block_table,
@@ -339,7 +339,11 @@ class MiniMaxM3SparseMSAImpl(MiniMaxM3SparseImpl):
             # [H, prefill, MK] transposed view; build_k2q_csr consumes the
             # strided view directly (topK stays innermost-contiguous).
             prefill_topk = topk[nd:num_tokens].transpose(0, 1)
-            qp = q[nd:]
+            qp = (
+                q[nd:]
+                if q_fp8 is None
+                else _dequantize_query(q_fp8[nd:], q_scale_float, q[nd:])
+            )
             k2q_row_ptr, k2q_q_indices, schedule = build_k2q_csr(
                 prefill_topk,
                 p.cu_seqlens_q,
@@ -353,9 +357,7 @@ class MiniMaxM3SparseMSAImpl(MiniMaxM3SparseImpl):
                 return_schedule=True,
             )
             if self.use_nvfp4_kv:
-                k_side, v_side = kv_cache.split(self.num_kv_heads, dim=1)
-                k_data, k_sf = _nvfp4_data_scale_views(k_side)
-                v_data, v_sf = _nvfp4_data_scale_views(v_side)
+                k_data, k_sf, v_data, v_sf = nvfp4_kv_cache_views(kv_cache)
                 sparse_atten_nvfp4_kv_func(
                     qp,
                     k_data,

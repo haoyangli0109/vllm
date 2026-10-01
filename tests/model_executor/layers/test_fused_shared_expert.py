@@ -18,6 +18,7 @@ import vllm.envs as envs
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.fused_moe import utils as fused_moe_utils
 from vllm.model_executor.layers.fused_moe.layer import determine_expert_counts
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.model_executor.layers.quantization.quark.quark import QuarkConfig
 from vllm.model_executor.layers.quantization.utils.config_utils import (
@@ -141,10 +142,15 @@ def get_deepseek_v4_quark_config(exclude: list[str]) -> dict[str, Any]:
     return quantization_config
 
 
+def _stub_quant_config() -> QuantizationConfig:
+    return cast(QuantizationConfig, object())
+
+
 def get_fse_test_model_config(
     model_type: str,
     quantization_config: dict[str, Any],
 ) -> tuple[object, type[nn.Module]]:
+    config: object
     if model_type == "minimax_m3":
         config = MiniMaxM3TextConfig(
             hidden_size=128,
@@ -302,7 +308,7 @@ def test_resolve_layer_fused_shared_expert_skips_compatibility_when_disabled(
     )
 
     assert not fused_moe_utils.resolve_layer_fused_shared_expert(
-        object(), "model.layers.0.mlp"
+        _stub_quant_config(), "model.layers.0.mlp"
     )
 
 
@@ -317,7 +323,7 @@ def test_resolve_layer_fused_shared_expert_normalizes_unavailable_aiter(
 
     assert (
         fused_moe_utils.resolve_layer_fused_shared_expert(
-            object(), "model.layers.0.mlp"
+            _stub_quant_config(), "model.layers.0.mlp"
         )
         is False
     )
@@ -326,7 +332,7 @@ def test_resolve_layer_fused_shared_expert_normalizes_unavailable_aiter(
 def test_resolve_layer_fused_shared_expert_passes_module_prefixes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    quant_config = object()
+    quant_config = _stub_quant_config()
     monkeypatch.setattr(
         fused_moe_utils.rocm_aiter_ops,
         "is_fusion_moe_shared_experts_enabled",
@@ -375,7 +381,7 @@ def test_resolve_layer_fused_shared_expert_rejects_incompatible_quantization(
     )
 
     assert not fused_moe_utils.resolve_layer_fused_shared_expert(
-        object(), "model.layers.0.mlp"
+        _stub_quant_config(), "model.layers.0.mlp"
     )
     assert "shared experts are excluded" in caplog.text
 
@@ -1285,7 +1291,7 @@ def test_quark_packed_layer_config_must_match_global_config() -> None:
 
 def test_non_quark_shared_expert_fse_is_incompatible() -> None:
     compatible, reason = is_shared_expert_quant_fse_compatible(
-        object(),
+        _stub_quant_config(),
         "model.layers.0.mlp.experts",
         "model.layers.0.mlp.shared_experts",
     )

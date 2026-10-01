@@ -32,6 +32,28 @@ def is_nvfp4_kv_cache(kv_cache_dtype: str) -> bool:
     return get_kv_quant_mode(kv_cache_dtype).is_nvfp4
 
 
+def nvfp4_kv_cache_views(
+    kv_cache: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return the K data, K scale, V data and V scale views of an NVFP4 cache.
+
+    ``kv_cache`` is uint8 ``[pages, 2 * Hkv, page_size, 72]``; slot
+    ``2 * head + side`` (K = 0, V = 1) is that head's E2M1 data
+    ``[page_size, 64]`` followed by its E4M3 block scales ``[page_size, 8]``,
+    the one page layout ``fmha_sm100`` reads.
+    """
+    from vllm.third_party.fmha_sm100.nvfp4_kv import nvfp4_head_slot_views
+
+    return nvfp4_head_slot_views(*nvfp4_kv_cache_slots(kv_cache))
+
+
+def nvfp4_kv_cache_slots(
+    kv_cache: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return the per-head K and V slots of an NVFP4 cache."""
+    return kv_cache[:, 0::2], kv_cache[:, 1::2]
+
+
 @dataclass
 class MSACutlassDecodeMetadata:
     plan: Any
@@ -97,6 +119,9 @@ class MSACutlassDecodePlanCache:
             use_fp8_kvcache=True,
             split_prefill_decode=False,
             device=device,
+            # The Q8KV4 route keeps plan-time lengths and its own page offsets,
+            # which this cached plan does not refresh.
+            decode_backend="kv_mode3",
         )
 
         plan_info = plan[3]
@@ -304,12 +329,12 @@ def msa_cutlass_sparse_decode(
 ) -> None:
     """Run CUTLASS sparse decode with metadata prepared by the MSA builder.
 
-    NVFP4 caches are uint8 ``[pages, 2 * Hkv, page_size, 72]`` (K heads, then
-    V heads) and take the device global scales ``k_scale``/``v_scale``.
+    NVFP4 caches are uint8 head-slot pages (see ``nvfp4_kv_cache_views``) and
+    take the device global scales ``k_scale``/``v_scale``.
     """
     if kv_cache.dtype == torch.uint8:
         assert k_scale is not None and v_scale is not None
-        key, value = kv_cache.split(kv_cache.shape[1] // 2, dim=1)
+        key, value = nvfp4_kv_cache_slots(kv_cache)
         k_scale_arg: float | torch.Tensor = k_scale
         v_scale_arg: float | torch.Tensor = v_scale
     else:
