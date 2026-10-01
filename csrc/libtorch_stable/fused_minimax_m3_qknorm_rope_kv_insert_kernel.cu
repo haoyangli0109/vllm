@@ -296,12 +296,13 @@ __device__ __forceinline__ void storeScaledQElemsFp8(
 // 16-element scale group is four lanes. SM100-family builds of this file
 // (CMake gives it family-specific SM10x/11x targets) encode E2M1 with
 // cvt.rn.satfinite.e2m1x2; other targets use a bit-exact software encoder.
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000 && \
-    defined(__CUDA_ARCH_FAMILY_SPECIFIC__)
-  #define MINIMAX_M3_NVFP4_NATIVE_CVT 1
-#else
-  #define MINIMAX_M3_NVFP4_NATIVE_CVT 0
-#endif
+#ifndef USE_ROCM
+  #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000 && \
+      defined(__CUDA_ARCH_FAMILY_SPECIFIC__)
+    #define MINIMAX_M3_NVFP4_NATIVE_CVT 1
+  #else
+    #define MINIMAX_M3_NVFP4_NATIVE_CVT 0
+  #endif
 constexpr int kNvfp4DataBytes = kHeadDim / 2;            // 64
 constexpr int kNvfp4ScaleBytes = kHeadDim / 16;          // 8
 constexpr int kNvfp4LanesPerGroup = 16 / kElemsPerLane;  // 4
@@ -329,7 +330,7 @@ __device__ __forceinline__ uint32_t e2m1Code(float x) {
   return mag | ((__float_as_uint(x) >> 28) & 0x8u);
 }
 
-#ifndef USE_ROCM
+// (helpers above and the NVFP4 store below are CUDA-only)
 // E4M3 block scale for a group whose largest magnitude maps to 6, and the
 // factor that takes a value to its E2M1 code.
 __device__ __forceinline__ void nvfp4GroupScale(float sf_scale, float group_max,
