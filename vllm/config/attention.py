@@ -84,7 +84,8 @@ class AttentionConfig:
     """Data type for the sparse-attention indexer K cache. "auto" picks the
     model's default (bf16 for MiniMax M3, fp8 for the DeepSeek sparse
     indexer). Quantized formats (fp8, mxfp4, nvfp4) require indexer kernel
-    support in the backend."""
+    support in the backend; MiniMax M3 supports nvfp4 on SM100/SM103 with at
+    most 8 decode queries per request."""
 
     indexer_sparse_logits: bool = False
     """DeepSeek V4.1 two-level indexer: score only the candidate blocks with

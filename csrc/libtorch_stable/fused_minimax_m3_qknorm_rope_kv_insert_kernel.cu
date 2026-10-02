@@ -558,13 +558,16 @@ __device__ __forceinline__ void storeNvfp4CacheElems(
 //     IK: 1    only if kProcessIndex    (norm+RoPE; +index-cache insert)
 // cache_t/kv_dt: main attention KV-cache dtype (auto/fp8). out_idx_t/kFp8Idx:
 // indexer index-K cache + index-Q output dtype (scalar_t or e4m3 byte).
+// kNvfp4Idx (implies kFp8Idx): the index-K cache is instead packed NVFP4 pages
+// [nb, bs, 72] (bs*64 B E2M1, then bs*8 B linear E4M3 scales, no global scale),
+// the layout of the MSA Q8KV4 indexer; index-Q stays e4m3.
 // kHasIndex means the qkv row is laid out as sparse [q|k|v|index_q|index_k].
 // kProcessIndex controls whether this launch actually norms/ropes the index
 // branch and writes index_q/index_k outputs. Skip-index-topk reuse layers keep
 // kHasIndex=true but set kProcessIndex=false.
 template <typename scalar_t, typename cache_t, Fp8KVCacheDataType kv_dt,
           bool kNvfp4, typename out_idx_t, bool kHasIndex, bool kInsertKV,
-          bool kProcessIndex, bool kFp8Idx>
+          bool kProcessIndex, bool kFp8Idx, bool kNvfp4Idx>
 __global__ void fusedMiniMaxM3QNormRopeKVInsertKernel(
     scalar_t* __restrict__ qkv,  // [N, qkv_row] in/out (packs index if sparse)
     scalar_t* __restrict__ q_out,         // [N, nq*128] contiguous, or nullptr
@@ -588,6 +591,8 @@ __global__ void fusedMiniMaxM3QNormRopeKVInsertKernel(
     // NHD/HND layout choice is captured by the head/token strides.
     int64_t const kv_s_block, int64_t const kv_s_head, int64_t const kv_s_token,
     int64_t const kv_s_dim,
+    // NVFP4 index cache only: page stride in bytes.
+    int64_t const idx_s_block,
     // NVFP4 main cache only: per-layer K/V dequantization (global) scales.
     float const* __restrict__ kv_k_scale,
     float const* __restrict__ kv_v_scale) {
@@ -604,6 +609,8 @@ __global__ void fusedMiniMaxM3QNormRopeKVInsertKernel(
 
     static_assert(!kProcessIndex || kHasIndex,
                   "index processing requires sparse row layout");
+    static_assert(!kNvfp4Idx || (kFp8Idx && kInsertKV),
+                  "NVFP4 index cache requires fp8 index-Q and cache insert");
 
     // Slot layout (compile-time gated: dense has neither V nor index slots).
     int const v_slots = kInsertKV ? nkv : 0;
@@ -754,7 +761,16 @@ __global__ void fusedMiniMaxM3QNormRopeKVInsertKernel(
       }
       if (sm >= 0) {  // skip padded / unscheduled tokens
         if (isIK) {
-          if constexpr (kFp8Idx) {
+          if constexpr (kNvfp4Idx) {
+#ifndef USE_ROCM
+            // A single-head K side: data [bs, 64] then linear scales [bs, 8].
+            storeNvfp4CacheElems<scalar_t>(
+                reinterpret_cast<uint8_t*>(index_cache) +
+                    (sm / block_size) * idx_s_block,
+                /*kv=*/0, /*head=*/0, static_cast<int>(sm % block_size),
+                block_size, laneId, elems, /*scale=*/1.0f);
+#endif
+          } else if constexpr (kFp8Idx) {
             storeElemsFp8(index_cache + sm * kHeadDim + dim_base, elems);
           } else {
             storeElems<scalar_t>(index_cache + sm * kHeadDim + dim_base, elems);
@@ -809,9 +825,10 @@ void launchFusedMiniMaxM3(
     float const q_fp8_inv_scale, int const rotary_dim, int const num_tokens,
     int const nq, int const nkv, int const niq, int const block_size,
     int64_t const kv_s_block, int64_t const kv_s_head, int64_t const kv_s_token,
-    int64_t const kv_s_dim, bool const has_index, bool const insert_kv,
-    bool const process_index, bool const fp8_idx, float const* kv_k_scale,
-    float const* kv_v_scale, cudaStream_t stream) {
+    int64_t const kv_s_dim, int64_t const idx_s_block, bool const has_index,
+    bool const insert_kv, bool const process_index, bool const fp8_idx,
+    bool const nvfp4_idx, float const* kv_k_scale, float const* kv_v_scale,
+    cudaStream_t stream) {
   // Index outputs are scalar_t (bf16) or e4m3 bytes (uint8_t); reinterpret the
   // void* pointers per instantiation in the LAUNCH macro.
   // Slot count must match the kernel's compile-time gating.
@@ -843,69 +860,77 @@ void launchFusedMiniMaxM3(
   config.attrs = attrs;
   config.numAttrs = (sm_version >= 90) ? 1 : 0;
 
-  #define LAUNCH(HAS_INDEX, INSERT, PROCESS_INDEX, FP8, OUT_T)              \
+  #define LAUNCH(HAS_INDEX, INSERT, PROCESS_INDEX, FP8, NVFP4_IDX, OUT_T)   \
     cudaLaunchKernelEx(                                                     \
         &config,                                                            \
-        fusedMiniMaxM3QNormRopeKVInsertKernel<scalar_t, cache_t, kv_dt,     \
-                                              kNvfp4, OUT_T, HAS_INDEX,     \
-                                              INSERT, PROCESS_INDEX, FP8>,  \
+        fusedMiniMaxM3QNormRopeKVInsertKernel<                              \
+            scalar_t, cache_t, kv_dt, kNvfp4, OUT_T, HAS_INDEX, INSERT,     \
+            PROCESS_INDEX, FP8, NVFP4_IDX>,                                 \
         qkv, q_out, q_fp8_out, reinterpret_cast<OUT_T*>(index_q_out),       \
         q_norm_w, k_norm_w, iq_norm_w, ik_norm_w, cos_sin_cache, positions, \
         slot_mapping, index_slot_mapping, kv_cache,                         \
         reinterpret_cast<OUT_T*>(index_cache), eps, q_fp8_inv_scale,        \
         rotary_dim, num_tokens, nq, nkv, niq, block_size, kv_s_block,       \
-        kv_s_head, kv_s_token, kv_s_dim, kv_k_scale, kv_v_scale)
+        kv_s_head, kv_s_token, kv_s_dim, idx_s_block, kv_k_scale, kv_v_scale)
 #else
   // ROCm: standard kernel launch syntax (no PDL/stream serialization).
   // clang-format off
-  #define LAUNCH(HAS_INDEX, INSERT, PROCESS_INDEX, FP8, OUT_T)              \
+  #define LAUNCH(HAS_INDEX, INSERT, PROCESS_INDEX, FP8, NVFP4_IDX, OUT_T)   \
     fusedMiniMaxM3QNormRopeKVInsertKernel<                                  \
         scalar_t, cache_t, kv_dt, kNvfp4, OUT_T, HAS_INDEX, INSERT,         \
-        PROCESS_INDEX, FP8><<<grid, kBlockSize, 0, stream>>>(               \
+        PROCESS_INDEX, FP8, NVFP4_IDX><<<grid, kBlockSize, 0, stream>>>(    \
         qkv, q_out, q_fp8_out, reinterpret_cast<OUT_T*>(index_q_out),       \
         q_norm_w, k_norm_w, iq_norm_w, ik_norm_w, cos_sin_cache, positions, \
         slot_mapping, index_slot_mapping, kv_cache,                         \
         reinterpret_cast<OUT_T*>(index_cache), eps, q_fp8_inv_scale,        \
         rotary_dim, num_tokens, nq, nkv, niq, block_size, kv_s_block,       \
-        kv_s_head, kv_s_token, kv_s_dim, kv_k_scale, kv_v_scale)
+        kv_s_head, kv_s_token, kv_s_dim, idx_s_block, kv_k_scale,           \
+        kv_v_scale)
   // clang-format on
 #endif
 
   if constexpr (kNvfp4) {
     // NVFP4 main cache: sparse serving only (the host checks insert_kv).
     if (!process_index) {
-      LAUNCH(true, true, false, false, scalar_t);
+      LAUNCH(true, true, false, false, false, scalar_t);
+    } else if (nvfp4_idx) {
+      LAUNCH(true, true, true, true, true, uint8_t);
     } else if (fp8_idx) {
-      LAUNCH(true, true, true, true, uint8_t);
+      LAUNCH(true, true, true, true, false, uint8_t);
     } else {
-      LAUNCH(true, true, true, false, scalar_t);
+      LAUNCH(true, true, true, false, false, scalar_t);
     }
   } else if (has_index) {
     if (!process_index) {
       if (insert_kv) {
-        LAUNCH(true, true, false, false, scalar_t);
+        LAUNCH(true, true, false, false, false, scalar_t);
       } else {
-        LAUNCH(true, false, false, false, scalar_t);
+        LAUNCH(true, false, false, false, false, scalar_t);
       }
     } else if (insert_kv) {
-      if (fp8_idx) {
-        LAUNCH(true, true, true, true,
+      if (nvfp4_idx) {
+        LAUNCH(true, true, true, true, true,
+               uint8_t);  // sparse serving, NVFP4 index-K, fp8 index_q
+      } else if (fp8_idx) {
+        LAUNCH(true, true, true, true, false,
                uint8_t);  // sparse serving, fp8 index outputs
       } else {
-        LAUNCH(true, true, true, false, scalar_t);  // sparse serving, bf16
+        LAUNCH(true, true, true, false, false,
+               scalar_t);  // sparse serving, bf16
       }
     } else {
       if (fp8_idx) {
-        LAUNCH(true, false, true, true,
+        LAUNCH(true, false, true, true, false,
                uint8_t);  // sparse profiling, fp8 index_q
       } else {
-        LAUNCH(true, false, true, false, scalar_t);  // sparse profiling, bf16
+        LAUNCH(true, false, true, false, false,
+               scalar_t);  // sparse profiling, bf16
       }
     }
   } else {
     // Dense layer: never has an index branch and never inserts here (the
     // generic Attention layer owns the KV insert).
-    LAUNCH(false, false, false, false, scalar_t);
+    LAUNCH(false, false, false, false, false, scalar_t);
   }
 #undef LAUNCH
 }
@@ -948,8 +973,8 @@ void launchFusedMiniMaxM3(
       static_cast<float>(eps), 1.0f / static_cast<float>(q_fp8_scale),          \
       static_cast<int>(rotary_dim), num_tokens, nq, nkv, niq,                  \
       static_cast<int>(block_size), kv_s_block, kv_s_head, kv_s_token,         \
-      kv_s_dim, has_index, insert_kv, process_index, fp8_idx, kv_k_scale_ptr,  \
-      kv_v_scale_ptr, stream)
+      kv_s_dim, idx_s_block, has_index, insert_kv, process_index, fp8_idx,     \
+      nvfp4_idx, kv_k_scale_ptr, kv_v_scale_ptr, stream)
 #define CALL_FUSED_MINIMAX_M3(_RAW_T, CACHE_T, KV_DTYPE)                       \
   CALL_FUSED_MINIMAX_M3_IMPL(CACHE_T, KV_DTYPE, false)
 // clang-format on
@@ -1084,14 +1109,18 @@ void fused_minimax_m3_qknorm_rope_kv_insert(
           kv_cache->scalar_type() == torch::headeronly::ScalarType::Byte,
           "fp8 kv_cache must use uint8 storage");
     }
-    // Indexer index-K cache: independent dtype -- qkv dtype or fp8 e4m3.
+    // Indexer index-K cache: independent dtype -- qkv dtype, fp8 e4m3, or
+    // uint8 packed NVFP4 pages.
     if (process_index) {
       STD_TORCH_CHECK(
           index_cache.has_value() &&
               (index_cache->scalar_type() == qkv.scalar_type() ||
                index_cache->scalar_type() ==
-                   torch::headeronly::ScalarType::Float8_e4m3fn),
-          "insert mode requires index_cache matching qkv dtype or fp8 e4m3");
+                   torch::headeronly::ScalarType::Float8_e4m3fn ||
+               index_cache->scalar_type() ==
+                   torch::headeronly::ScalarType::Byte),
+          "insert mode requires index_cache matching qkv dtype, fp8 e4m3, "
+          "or uint8 (nvfp4)");
     }
     STD_TORCH_CHECK(kv_cache->dim() == 4 && kv_cache->stride(3) == 1,
                     "kv_cache must be [nb,nkv,bs,2*head_dim] with contiguous "
@@ -1166,16 +1195,36 @@ void fused_minimax_m3_qknorm_rope_kv_insert(
   }
 
   // fp8 index path: the index-K cache and index-Q outputs are e4m3 bytes while
-  // q/k/v + q_out stay qkv dtype. Both index outputs must agree.
+  // q/k/v + q_out stay qkv dtype. Both index outputs must agree. The NVFP4
+  // index path keeps e4m3 index-Q and stores index-K as packed NVFP4 pages.
   auto const kFp8 = torch::headeronly::ScalarType::Float8_e4m3fn;
+  bool const nvfp4_idx =
+      process_index && insert_kv &&
+      index_cache->scalar_type() == torch::headeronly::ScalarType::Byte;
   bool const fp8_idx =
       process_index &&
-      ((index_cache.has_value() && index_cache->scalar_type() == kFp8) ||
+      (nvfp4_idx ||
+       (index_cache.has_value() && index_cache->scalar_type() == kFp8) ||
        (index_q_out.has_value() && index_q_out->scalar_type() == kFp8));
-  if (fp8_idx) {
+  int64_t idx_s_block = 0;
+  if (nvfp4_idx) {
+#ifdef USE_ROCM
+    STD_TORCH_CHECK(false, "nvfp4 index_cache is not supported on ROCm");
+#endif
+    int64_t const page_width = kHeadDim / 2 + kHeadDim / 16;
     STD_TORCH_CHECK(
-        !index_cache.has_value() || index_cache->scalar_type() == kFp8,
-        "fp8 index path: index_cache must be fp8 e4m3");
+        index_cache->dim() == 3 && index_cache->size(1) == block_size &&
+            index_cache->size(2) == page_width && index_cache->stride(2) == 1 &&
+            index_cache->stride(1) == page_width &&
+            index_cache->stride(0) >= block_size * page_width,
+        "nvfp4 index_cache must be [nb, block_size, 72] uint8 with "
+        "contiguous pages");
+    idx_s_block = index_cache->stride(0);
+  }
+  if (fp8_idx) {
+    STD_TORCH_CHECK(!index_cache.has_value() || nvfp4_idx ||
+                        index_cache->scalar_type() == kFp8,
+                    "fp8 index path: index_cache must be fp8 e4m3");
     STD_TORCH_CHECK(
         !index_q_out.has_value() || index_q_out->scalar_type() == kFp8,
         "fp8 index path: index_q_out must be fp8 e4m3");

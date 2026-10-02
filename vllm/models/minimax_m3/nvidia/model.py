@@ -608,6 +608,7 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             or self.layer_name not in fwd_slot_mapping
         ):
             # Memory-profiling run: caches not yet bound, slot_mapping is empty.
+            self.indexer.reserve_workspace()
             return qkv.new_zeros((num_tokens, self.hidden_size))
 
         main_slot_mapping = fwd_slot_mapping[self.layer_name]
@@ -616,11 +617,11 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         # With query_fp8, q is emitted only in fp8; the attend dequantizes it
         # into ``q`` for the tokens that run on bf16-query kernels.
         query_fp8 = self._allocate_query_fp8(qkv)
-        # index_q matches the index-K cache dtype (e4m3 for the fp8 score path);
-        # the fused kernel emits fp8 directly when this buffer is e4m3.
+        # index_q is e4m3 for the fp8 and nvfp4 index caches, else bf16; the
+        # fused kernel emits fp8 directly when this buffer is e4m3.
         index_q = qkv.new_empty(
             (num_tokens, self.index_q_size),
-            dtype=self.indexer.index_cache.dtype,
+            dtype=self.indexer.index_cache.query_dtype,
         )
         ops.fused_minimax_m3_qknorm_rope_kv_insert(
             qkv,
