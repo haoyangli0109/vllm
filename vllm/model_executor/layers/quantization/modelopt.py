@@ -1751,8 +1751,8 @@ class Nvfp4ExpertsAsMxfp4FusedMoE(Mxfp4OnlineMoEMethod):
     grid a second time: the weight error is of the order of the NVFP4
     quantization error itself.
 
-    Loading is the same as Nvfp4ExpertsAsMxfp8FusedMoE. The shared expert is
-    not fused: it stays MXFP8, as stored.
+    Loading is the same as Nvfp4ExpertsAsMxfp8FusedMoE; with shared-expert
+    fusion the MXFP8 shared slots are re-quantized to MXFP4 and appended.
     """
 
     NVFP4_GROUP_SIZE = Nvfp4ExpertsAsMxfp8FusedMoE.NVFP4_GROUP_SIZE
@@ -1800,9 +1800,6 @@ class Nvfp4ExpertsAsMxfp4FusedMoE(Mxfp4OnlineMoEMethod):
             )
 
         routed = layer.num_routed_slots
-        # No fused shared-expert slots: the shared expert stays MXFP8, as stored
-        # (is_shared_expert_quant_fse_compatible refuses the fusion).
-        assert routed == layer.num_experts, (routed, layer.num_experts)
         w13, w13_scale = requantize_nvfp4_moe_weight(
             layer.w13_weight_packed[:routed],
             layer.w13_weight_scale[:routed],
@@ -1817,6 +1814,33 @@ class Nvfp4ExpertsAsMxfp4FusedMoE(Mxfp4OnlineMoEMethod):
             mxfp4_quantize,
             torch.bfloat16,
         )
+        if routed < layer.num_experts:
+            # Fused shared-expert slots arrive as MXFP8; re-quantize them to MXFP4
+            # (MXFP8 -> bf16 -> MXFP4) and append after the routed experts.
+            from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+                dequant_mxfp8_to_bf16,
+            )
+
+            def _shared_to_mxfp4(w_fp8, s_e8m0):
+                n_sh, rows, k = w_fp8.shape
+                bf = dequant_mxfp8_to_bf16(
+                    w_fp8.reshape(-1, k), s_e8m0.reshape(-1, k // 32)
+                )
+                q, qs = mxfp4_quantize(bf.to(torch.bfloat16))
+                return q.view(n_sh, rows, -1), qs.view(n_sh, rows, -1)
+
+            sh13, sh13_scale = _shared_to_mxfp4(
+                layer.w13_weight.data, layer.w13_shared_weight_scale.data
+            )
+            sh2, sh2_scale = _shared_to_mxfp4(
+                layer.w2_weight.data, layer.w2_shared_weight_scale.data
+            )
+            w13 = torch.cat([w13, sh13.to(w13.dtype)])
+            w2 = torch.cat([w2, sh2.to(w2.dtype)])
+            w13_scale = torch.cat([w13_scale, sh13_scale.to(w13_scale.dtype)])
+            w2_scale = torch.cat([w2_scale, sh2_scale.to(w2_scale.dtype)])
+            delattr(layer, "w13_shared_weight_scale")
+            delattr(layer, "w2_shared_weight_scale")
         for name in (
             "w13_weight_packed",
             "w2_weight_packed",

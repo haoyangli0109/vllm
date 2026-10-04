@@ -86,13 +86,14 @@ def is_shared_expert_quant_fse_compatible(
 
     if isinstance(quant_config, ModelOptMxFp8Config):
         from vllm.model_executor.layers.quantization.utils.quant_utils import (
+            kMxfp4Static,
             kMxfp8Static,
         )
 
-        # The shared expert is stored as MXFP8; it can take an expert slot only
-        # when the routed experts run in that same format, and neither side is
-        # excluded from quantization.
-        if quant_config.routed_expert_weight_key() != kMxfp8Static:
+        # The shared expert is stored as MXFP8; it can take an expert slot when
+        # the routed experts run as MXFP8 (as stored) or MXFP4 (the slot is
+        # re-quantized at load), and neither side is excluded from quantization.
+        if quant_config.routed_expert_weight_key() not in (kMxfp8Static, kMxfp4Static):
             return (
                 False,
                 "routed experts do not run as MXFP8 like the shared expert at "

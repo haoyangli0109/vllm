@@ -102,6 +102,7 @@ from vllm.models.minimax_m3.amd.ops.sparse_pa import (
     minimax_m3_alloc_sparse_block_table,
     minimax_m3_sparse_block_page_stride,
 )
+from vllm.models.minimax_m3.amd.mono.envs import envs as mono_envs
 from vllm.models.minimax_m3.amd.sparse_attention_msa import (
     MiniMaxM3SparseAiterPADecodeMetadata,
     MiniMaxM3SparseAiterPAImpl,
@@ -1461,6 +1462,13 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
         )
+        # VLLM_ROCM_MINIMAX_M3_MONO=1: supported decode steps run one FlyDSL
+        # launch per layer (mono kernels)
+        self._mono = None
+        if mono_envs.MONO_ENABLE:
+            from vllm.models.minimax_m3.amd.mono.dispatch import MonoDecode
+
+            self._mono = MonoDecode(self, vllm_config)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -1472,6 +1480,10 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
+        if self._mono is not None and self._mono.supports(
+            input_ids, positions, intermediate_tensors, inputs_embeds
+        ):
+            return self._mono.forward(input_ids, positions, inputs_embeds)
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
