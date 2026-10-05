@@ -18,11 +18,16 @@ import torch
 from torch import nn
 from transformers import PreTrainedConfig
 
+import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
-from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
-from vllm.forward_context import get_forward_context
+from vllm.distributed import (
+    get_pp_group,
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.model_executor.layers.activation import SiluAndMulWithClamp
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention.attention import set_default_quant_scales
@@ -34,6 +39,9 @@ from vllm.model_executor.layers.fused_moe import (
     FusedMoEFactory,
     GateLinear,
     fused_moe_make_expert_params_mapping,
+)
+from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
+    fused_topk_bias,
 )
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
@@ -71,6 +79,11 @@ from vllm.model_executor.models.utils import (
     spec_decode_needs_target_embed,
 )
 from vllm.model_executor.models.vision import run_dp_sharded_mrope_vision_model
+from vllm.models.common.ops.sequence_parallel import (
+    sp_all_gather,
+    sp_padding_mask,
+    sp_shard,
+)
 from vllm.models.minimax_m3.common.encoder_cudagraph import (
     MiniMaxM3EncoderCudaGraphMixin,
 )
@@ -86,9 +99,15 @@ from vllm.models.minimax_m3.common.sparse_attention import (
     select_main_backend_and_impl_cls,
 )
 from vllm.models.minimax_m3.common.vision_tower import MiniMaxVLVisionModel
+from vllm.models.minimax_m3.nvidia.mega_moe import (
+    MiniMaxM3MegaMoESharedExpert,
+    MiniMaxM3NvFp4MegaMoEExperts,
+    make_minimax_m3_mega_moe_expert_params_mapping,
+)
 from vllm.models.minimax_m3.nvidia.sparse_attention_msa import MiniMaxM3SparseMSAImpl
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
+from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -114,6 +133,29 @@ def _is_moe_layer(config: PreTrainedConfig, layer_id: int) -> bool:
     if moe_layer_freq is None:
         return True
     return moe_layer_freq[layer_id] != 0
+
+
+def _use_mega_moe(vllm_config: VllmConfig) -> bool:
+    """Whether MoE layers run the DeepGEMM NVFP4 MegaMoE kernel.
+
+    Opt in with ``--kernel-config '{"moe_backend": "deep_gemm_mega_moe"}'``. Only
+    checkpoints with NVFP4 routed experts (MiniMax-M3.1) are supported.
+    """
+    if vllm_config.kernel_config.moe_backend != "deep_gemm_mega_moe":
+        return False
+    moe_quant_algo = getattr(vllm_config.quant_config, "moe_quant_algo", None)
+    if moe_quant_algo != "NVFP4":
+        raise NotImplementedError(
+            "MiniMax M3 MegaMoE requires a checkpoint with NVFP4 routed experts "
+            f"(moe_quant_algo: NVFP4), got moe_quant_algo={moe_quant_algo!r}. "
+            "Pick a different moe backend for this checkpoint."
+        )
+    if not vllm_config.parallel_config.enable_expert_parallel:
+        raise NotImplementedError(
+            "MiniMax M3 MegaMoE requires expert parallel. Enable it with "
+            "--enable-expert-parallel."
+        )
+    return True
 
 
 class MiniMAXGemmaRMSNorm(nn.Module):
@@ -204,6 +246,7 @@ class MiniMaxM3MoE(nn.Module):
         quant_config: QuantizationConfig | None = None,
         reduce_results: bool = True,
         prefix: str = "",
+        use_mega_moe: bool = False,
     ) -> None:
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -213,6 +256,10 @@ class MiniMaxM3MoE(nn.Module):
                 f"the number of experts {config.num_local_experts}."
             )
 
+        self.use_mega_moe = use_mega_moe
+        self.reduce_results = reduce_results
+        self.scoring_func = config.scoring_func
+        self.top_k = config.num_experts_per_tok
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
         self.n_shared_experts = getattr(config, "n_shared_experts", None)
 
@@ -239,7 +286,11 @@ class MiniMaxM3MoE(nn.Module):
             prefix=f"{prefix}.gate",
         )
 
-        self.shared_experts: MiniMaxM3MLP | None = None
+        self.shared_experts: MiniMaxM3MLP | MiniMaxM3MegaMoESharedExpert | None = None
+        if self.use_mega_moe:
+            self._init_mega_moe_experts(config)
+            return
+
         if self.n_shared_experts:
             self.shared_experts = MiniMaxM3MLP(
                 config=config,
@@ -272,14 +323,61 @@ class MiniMaxM3MoE(nn.Module):
             prefix=f"{prefix}.experts",
         )
 
+    def _init_mega_moe_experts(self, config: PreTrainedConfig) -> None:
+        if config.hidden_act != "swigluoai":
+            raise ValueError(
+                f"MiniMax M3 MegaMoE requires swigluoai, got {config.hidden_act}."
+            )
+        # Hidden states are replicated across TP ranks, so each rank routes
+        # only its own token shard through the EP-wide kernel.
+        self.use_sequence_parallel = self.tp_size > 1
+        n_shared_experts = self.n_shared_experts or 0
+        # The kernel fuses the shared expert, which therefore stays replicated.
+        self.shared_experts = (
+            MiniMaxM3MegaMoESharedExpert(
+                config.hidden_size, config.intermediate_size * n_shared_experts
+            )
+            if n_shared_experts
+            else None
+        )
+        max_num_tokens = (
+            get_current_vllm_config().scheduler_config.max_num_batched_tokens
+        )
+        self.experts = MiniMaxM3NvFp4MegaMoEExperts(
+            num_experts=config.num_local_experts,
+            top_k=self.top_k,
+            hidden_size=config.hidden_size,
+            intermediate_size=config.intermediate_size,
+            num_shared_experts=n_shared_experts,
+            max_num_tokens=cdiv(max_num_tokens, self.tp_size),
+            activation_clamp=config.swiglu_limit,
+            activation_alpha=config.swiglu_alpha,
+            activation_beta=config.swiglu_beta,
+        )
+
     @staticmethod
     def ebias_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
         assert param.size() == loaded_weight.size()
         param.data.copy_(loaded_weight.to(torch.float32))
 
+    @property
+    def ffn_all_reduce_deferred(self) -> bool:
+        if self.use_mega_moe:
+            return not self.reduce_results
+        return self.experts.moe_config.skip_final_all_reduce
+
+    def finalize_mega_moe_weights(self) -> None:
+        if not self.use_mega_moe:
+            return
+        self.experts.finalize_weights(self.shared_experts)
+        # The kernel holds the transformed shared-expert weights now.
+        self.shared_experts = None
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
+        if self.use_mega_moe:
+            return self._forward_mega_moe(hidden_states)
 
         # router_logits: (num_tokens, n_experts); GateLinear casts to fp32.
         router_logits, _ = self.gate(hidden_states)
@@ -288,6 +386,53 @@ class MiniMaxM3MoE(nn.Module):
         )
 
         return final_hidden_states.view(num_tokens, hidden_dim)
+
+    def _forward_mega_moe(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        num_tokens = hidden_states.shape[0]
+        is_padding = None
+        if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
+            is_padding = get_forward_context().is_padding
+            if is_padding is not None:
+                is_padding = is_padding[:num_tokens]
+        if self.use_sequence_parallel:
+            is_padding = sp_padding_mask(is_padding, hidden_states)
+            hidden_states = sp_shard(hidden_states)
+
+        router_logits, _ = self.gate(hidden_states)
+        topk_weights, topk_ids = fused_topk_bias(
+            hidden_states=hidden_states,
+            gating_output=router_logits,
+            scoring_func=self.scoring_func,
+            e_score_correction_bias=self.e_score_correction_bias.data
+            if self.e_score_correction_bias is not None
+            else None,
+            topk=self.top_k,
+            renormalize=True,
+            routed_scaling_factor=self.routed_scaling_factor,
+        )
+        if not self.use_sequence_parallel:
+            return self.experts(
+                hidden_states, topk_weights, topk_ids, is_padding=is_padding
+            )
+        if self.reduce_results:
+            local_output = self.experts(
+                hidden_states, topk_weights, topk_ids, is_padding=is_padding
+            )
+            return sp_all_gather(local_output)[:num_tokens]
+
+        # Write only this rank's shard and leave the other rows zero, so the
+        # deferred TP all-reduce (fused into the next RMSNorm) gathers them.
+        shard_size, hidden_dim = hidden_states.shape
+        tp_rank = get_tensor_model_parallel_rank()
+        output = hidden_states.new_zeros(shard_size * self.tp_size, hidden_dim)
+        self.experts(
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            is_padding=is_padding,
+            out=output[tp_rank * shard_size : (tp_rank + 1) * shard_size],
+        )
+        return output[:num_tokens]
 
 
 class MiniMaxM3Attention(nn.Module):
@@ -746,12 +891,18 @@ class MiniMaxM3DecoderLayer(nn.Module):
         )
         self.is_moe_layer = force_moe or _is_moe_layer(config, layer_id)
         if self.is_moe_layer:
+            use_mega_moe = _use_mega_moe(vllm_config)
+            if use_mega_moe and is_mtp_block:
+                raise NotImplementedError(
+                    "MiniMax M3 MegaMoE does not support MTP draft layers."
+                )
             self.block_sparse_moe = MiniMaxM3MoE(
                 config=config,
                 layer_id=layer_id,
                 quant_config=quant_config,
                 reduce_results=reduce_results,
                 prefix=f"{prefix}.block_sparse_moe",
+                use_mega_moe=use_mega_moe,
             )
         else:
             self.mlp = MiniMaxM3MLP(
@@ -817,7 +968,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
         """This layer's FFN output is left un-reduced; the caller fuses the
         all-reduce into the next RMSNorm."""
         if self.is_moe_layer:
-            return self.block_sparse_moe.experts.moe_config.skip_final_all_reduce
+            return self.block_sparse_moe.ffn_all_reduce_deferred
         return not self.mlp.down_proj.reduce_results
 
 
@@ -831,6 +982,7 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
         config = vllm_config.model_config.hf_text_config
         quant_config = vllm_config.quant_config
         self.config = config
+        self.use_mega_moe = _use_mega_moe(vllm_config)
 
         self.vocab_size = config.vocab_size
 
@@ -964,6 +1116,10 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
         return hidden_states
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
+        if self.use_mega_moe:
+            return make_minimax_m3_mega_moe_expert_params_mapping(
+                self.config.num_local_experts
+            )
         # Checkpoint experts use w1=gate, w2=down, w3=up.
         return fused_moe_make_expert_params_mapping(
             self,
@@ -1070,6 +1226,13 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
             loaded_params.add(name)
         return loaded_params
 
+    def finalize_mega_moe_weights(self) -> None:
+        if not self.use_mega_moe:
+            return
+        for layer in self.layers[self.start_layer : self.end_layer]:
+            if layer.is_moe_layer:
+                layer.block_sparse_moe.finalize_mega_moe_weights()
+
 
 class MiniMaxM3SparseForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
     """MiniMax M3 (sparse/dense backbone) for causal language modeling."""
@@ -1127,6 +1290,11 @@ class MiniMaxM3SparseForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights)
+
+    def process_weights_after_loading(self) -> None:
+        # Runs once after every load format (dummy included), unlike
+        # load_weights, which a wrapping loader may call per weight group.
+        self.model.finalize_mega_moe_weights()
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -1347,3 +1515,6 @@ class MiniMaxM3SparseForConditionalGeneration(
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+
+    def process_weights_after_loading(self) -> None:
+        self.language_model.process_weights_after_loading()
