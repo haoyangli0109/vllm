@@ -29,11 +29,13 @@ from vllm.models.minimax_m3.nvidia import (
 )
 from vllm.models.minimax_m3.nvidia.model import MiniMaxM3SparseAttention
 from vllm.models.minimax_m3.nvidia.msa_cutlass_sparse_decode import (
+    NVFP4_BLOCK_SCALE_SHIFT,
     MSACutlassDecodePlanCache,
     msa_cutlass_sparse_decode,
     nvfp4_kv_cache_views,
     prepare_decode_metadata,
     should_prepare_decode_metadata,
+    uses_q8kv4_decode,
 )
 from vllm.models.minimax_m3.nvidia.sparse_attention_msa import (
     MiniMaxM3SparseMSABackend,
@@ -290,6 +292,7 @@ def test_msa_metadata_builder_prepares_cutlass_for_regular_decode(
     builder.kv_cache_spec = SimpleNamespace(num_kv_heads=4)
     builder.kv_cache_dtype = "fp8_e4m3"
     builder.decode_backend = "cutlass"
+    builder.q8kv4_decode = False
     builder.msa_cutlass_plan_cache = object()
 
     metadata = builder.build(
@@ -782,6 +785,21 @@ def _make_nvfp4_kv_cache(
     return kv_cache, torch.cat(dequantized, dim=-1).to(torch.bfloat16)
 
 
+def _q8kv4_kv_reference(
+    kv_reference: torch.Tensor, k_scale: torch.Tensor, v_scale: torch.Tensor
+) -> torch.Tensor:
+    """The dequantized cache as the Q8KV4 kernels read it: block scales staged
+    by 2**NVFP4_BLOCK_SCALE_SHIFT, and each code * block_scale rounded to E4M3
+    for the FP8 tensor core."""
+    sides = []
+    for side, global_scale in zip(
+        kv_reference.float().split(HEAD_DIM, dim=-1), (k_scale, v_scale)
+    ):
+        unit = global_scale * 2.0**NVFP4_BLOCK_SCALE_SHIFT
+        sides.append((side / unit).to(torch.float8_e4m3fn).float() * unit)
+    return torch.cat(sides, dim=-1).to(torch.bfloat16)
+
+
 def test_nvfp4_kv_cache_views_address_head_slots() -> None:
     """Slot 2h (K) and 2h + 1 (V) hold head h's data then scales, so each head
     is one contiguous run of the page: a TP rank's page is a byte slice."""
@@ -816,8 +834,9 @@ def test_msa_cutlass_decode_nvfp4_matches_triton_on_dequantized_cache(
     query_len: int,
     capture: bool,
 ) -> None:
-    """CUTLASS decode reads vLLM's packed NVFP4 pages, including swizzled V
-    scales and device global scales, as their exact dequantized values."""
+    """Q8KV4 decode reads vLLM's packed NVFP4 pages, including swizzled V
+    scales and device global scales, as their exact dequantized values, and a
+    reused plan follows new lengths and zero-length padding requests."""
     torch.manual_seed(0)
     seq_lens_list = [257, 513] * num_request_pairs
     seq_lens_cpu = torch.tensor(seq_lens_list, dtype=torch.int32)
@@ -835,18 +854,27 @@ def test_msa_cutlass_decode_nvfp4_matches_triton_on_dequantized_cache(
     )
     query_fp8 = query.to(torch.float8_e4m3fn)
     topk = _make_topk(seq_lens_list, num_kv_heads, query_len)
-    expected = torch.empty_like(query)
-    minimax_m3_sparse_attn_decode(
-        query_fp8.to(torch.bfloat16),
-        kv_reference,
-        topk.transpose(0, 1),
-        block_table,
-        seq_lens,
-        num_kv_heads,
-        SM_SCALE,
-        expected,
-        query_len,
-    )
+    kv_reference = _q8kv4_kv_reference(kv_reference, k_scale, v_scale)
+
+    def reference(lens: list[int]) -> torch.Tensor:
+        # Padding requests (length 0) trail the batch and are not compared.
+        num_reqs = sum(1 for n in lens if n > 0)
+        rows = num_reqs * query_len
+        expected = torch.empty_like(query[:rows])
+        minimax_m3_sparse_attn_decode(
+            query_fp8[:rows].to(torch.bfloat16),
+            kv_reference,
+            topk[:rows].transpose(0, 1),
+            block_table[:num_reqs],
+            seq_lens[:num_reqs],
+            num_kv_heads,
+            SM_SCALE,
+            expected,
+            query_len,
+        )
+        return expected
+
+    expected = reference(seq_lens_list)
 
     assert should_prepare_decode_metadata(
         len(seq_lens_list),
@@ -858,16 +886,24 @@ def test_msa_cutlass_decode_nvfp4_matches_triton_on_dequantized_cache(
         page_size=BLOCK_SIZE,
         topk_blocks=TOPK,
     )
-    metadata = prepare_decode_metadata(
-        block_table,
-        seq_lens,
-        seq_lens_cpu,
-        query_len,
-        num_q_heads=num_q_heads,
-        num_kv_heads=num_kv_heads,
-        page_size=BLOCK_SIZE,
-        topk_blocks=TOPK,
-    )
+    plan_cache = MSACutlassDecodePlanCache()
+
+    def prepare(lens_cpu: torch.Tensor):
+        return prepare_decode_metadata(
+            block_table,
+            seq_lens,
+            lens_cpu,
+            query_len,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            page_size=BLOCK_SIZE,
+            topk_blocks=TOPK,
+            q8kv4=True,
+            plan_cache=plan_cache,
+        )
+
+    metadata = prepare(seq_lens_cpu)
+    assert "q8kv4" in metadata.plan[3]
     actual = torch.zeros_like(query)
 
     def run() -> None:
@@ -885,6 +921,7 @@ def test_msa_cutlass_decode_nvfp4_matches_triton_on_dequantized_cache(
             v_scale=v_scale,
         )
 
+    graph = None
     if capture:
         run()
         graph = torch.cuda.CUDAGraph()
@@ -897,6 +934,25 @@ def test_msa_cutlass_decode_nvfp4_matches_triton_on_dequantized_cache(
     current_platform.synchronize()
     torch.testing.assert_close(actual, expected, atol=0.05, rtol=0.05)
 
+    # Next step on the same plan: shorter requests and, as a padded full CUDA
+    # graph batch has, a trailing zero-length request.
+    updated_seq_lens_list = [129, 385] * num_request_pairs
+    updated_seq_lens_list[-1] = 0
+    seq_lens.copy_(torch.tensor(updated_seq_lens_list, dtype=torch.int32))
+    topk.copy_(_make_topk(updated_seq_lens_list, num_kv_heads, query_len))
+    updated_metadata = prepare(torch.tensor(updated_seq_lens_list, dtype=torch.int32))
+    assert updated_metadata.plan is metadata.plan
+    expected = reference(updated_seq_lens_list)
+    actual.zero_()
+    if graph is not None:
+        graph.replay()
+    else:
+        run()
+    current_platform.synchronize()
+    torch.testing.assert_close(
+        actual[: expected.shape[0]], expected, atol=0.05, rtol=0.05
+    )
+
 
 @pytest.mark.parametrize(
     ("num_q_heads", "num_kv_heads"),
@@ -907,8 +963,8 @@ def test_msa_prefill_nvfp4_matches_triton_on_dequantized_cache(
     num_kv_heads: int,
 ) -> None:
     """MSA prefill reads NVFP4 pages as their exact dequantized values,
-    including chunked prefill over cached context, and takes q from its fp8
-    copy (the only one the fused insert writes on this path)."""
+    including chunked prefill over cached context, on the Q8KV4 kernel with the
+    fp8 q the fused insert writes (the only q it writes on this path)."""
     torch.manual_seed(0)
     q_lens = [300, 128, 77]
     seq_lens_list = [300, 640, 1100]
@@ -976,6 +1032,7 @@ def test_msa_prefill_nvfp4_matches_triton_on_dequantized_cache(
         / q_scale
     ).to(torch.float8_e4m3fn)
     query = query_fp8.to(torch.bfloat16) * q_scale
+    kv_reference = _q8kv4_kv_reference(kv_reference, k_scale, v_scale)
     common = dict(
         num_heads=num_q_heads,
         head_size=HEAD_DIM,
@@ -993,15 +1050,42 @@ def test_msa_prefill_nvfp4_matches_triton_on_dequantized_cache(
         expected = MiniMaxM3SparseTritonImpl(**common).forward(
             layer, query, kv_reference, torch.empty_like(query)
         )
+        # As the model calls it for NVFP4: no bf16 q, only the fp8 one.
         actual = MiniMaxM3SparseMSAImpl(**common, kv_cache_dtype="nvfp4").forward(
             layer,
-            torch.full_like(query, float("nan")),
+            None,
             kv_cache,
             torch.zeros_like(query),
             query_fp8=query_fp8,
         )
     current_platform.synchronize()
-    torch.testing.assert_close(actual, expected, atol=0.05, rtol=0.05)
+    # Q8KV4 prefill rounds each split's probabilities to E4M3, which moves a
+    # rare element past the BF16 tolerance.
+    close = torch.isclose(actual, expected, atol=0.05, rtol=0.05)
+    assert close.float().mean().item() > 1 - 1e-4
+    torch.testing.assert_close(actual, expected, atol=0.25, rtol=0.05)
+
+
+def test_nvfp4_kv_cache_never_takes_a_bf16_query() -> None:
+    """NVFP4 attention runs only on the Q8KV4 kernels: a head layout they
+    cannot serve is rejected at init instead of falling back to BF16 Q."""
+    assert uses_q8kv4_decode(kv_cache_dtype="nvfp4", num_q_heads=16, num_kv_heads=1)
+    assert not uses_q8kv4_decode(
+        kv_cache_dtype="fp8_e4m3", num_q_heads=16, num_kv_heads=1
+    )
+    with pytest.raises(ValueError, match="Q8KV4"):
+        uses_q8kv4_decode(kv_cache_dtype="nvfp4", num_q_heads=4, num_kv_heads=1)
+    # 8 Q heads per KV head (TP8) decodes on Q8KV4 but cannot prefill on it.
+    with pytest.raises(ValueError, match="prefills only on the MSA Q8KV4"):
+        MiniMaxM3SparseMSAImpl(
+            num_heads=8,
+            head_size=HEAD_DIM,
+            scale=SM_SCALE,
+            num_kv_heads=1,
+            kv_cache_dtype="nvfp4",
+            topk_blocks=TOPK,
+            sparse_block_size=BLOCK_SIZE,
+        )
 
 
 def test_msa_triton_decode_fallback_reads_dequantized_query_fp8() -> None:

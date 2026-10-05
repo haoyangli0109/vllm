@@ -1158,6 +1158,8 @@ def test_nvfp4_indexer_impl_matches_reference(
         builder = MiniMaxM3IndexerNvfp4MetadataBuilder(
             spec, [impl.index_cache.prefix], vllm_config, device
         )
+    # Every TP layout (1, 2 or 4 index heads per rank) decodes in one launch.
+    assert builder.decode_num_heads == num_idx_heads
     index_spec = impl.index_cache.get_kv_cache_spec(vllm_config)
     assert index_spec.page_size_bytes == BLOCK_SIZE * _NVFP4_PAGE_WIDTH
     assert index_spec.dtype == torch.uint8

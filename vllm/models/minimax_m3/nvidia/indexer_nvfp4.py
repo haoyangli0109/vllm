@@ -20,9 +20,9 @@ logical block ids:
   pages fit the gather budget.
 
 All index heads of the rank share the index keys and select their own pages.
-Prefill scores every head in one launch, and so does decode for 1 or 4 heads;
-2 heads decode one head per launch. Prefill plans are rebuilt every step and
-only run eagerly (mixed batches are never captured whole).
+Prefill and decode score every head of the rank in one launch. Prefill plans
+are rebuilt every step and only run eagerly (mixed batches are never captured
+whole).
 """
 
 from dataclasses import dataclass, field
@@ -58,7 +58,7 @@ DECODE_QUERY_LEN = 8
 # Longest block table the MSA indexers accept.
 MAX_PAGES = 8192
 # Index heads the Q8KV4 decode indexer scores in one launch.
-DECODE_NUM_HEADS = (1, 4)
+DECODE_NUM_HEADS = (1, 2, 4)
 
 
 def _msa_indexers():
