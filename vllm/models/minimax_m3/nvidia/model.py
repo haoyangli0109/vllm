@@ -776,6 +776,12 @@ class MiniMaxM3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        hidden_states, residual = self.forward_input_norm(hidden_states, residual)
+        return self.forward_after_input_norm(positions, hidden_states, residual)
+
+    def forward_input_norm(
+        self, hidden_states: torch.Tensor, residual: torch.Tensor | None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.fuse_input_allreduce and residual is not None:
             hidden_states, residual = fused_allreduce_gemma_rms_norm(
                 hidden_states, residual, self.input_layernorm
@@ -786,6 +792,14 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 hidden_states = self.input_layernorm(hidden_states)
             else:
                 hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        return hidden_states, residual
+
+    def forward_after_input_norm(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -903,23 +917,30 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
             residual = intermediate_tensors["residual"]
 
         remote_aux = self.collect_remote_aux_hidden_states(intermediate_tensors)
+
+        # Aux hidden state k is the residual stream entering layer k. Under TP
+        # it is only complete after layer k's input norm (or the final norm)
+        # finishes the previous FFN's deferred all-reduce, so it is read there.
+        # Cloned, as the norms may update `residual` in place.
         aux_hidden_states: list[torch.Tensor] = []
-        if get_pp_group().is_first_rank:
-            self._maybe_add_hidden_state(
-                aux_hidden_states, self.start_layer, hidden_states, residual
-            )
-            # Preserve the entry tap before in-place residual updates.
-            if aux_hidden_states:
-                aux_hidden_states[0] = aux_hidden_states[0].clone()
         for idx, layer in enumerate(
             self.layers[self.start_layer : self.end_layer], start=self.start_layer
         ):
-            hidden_states, residual = layer(positions, hidden_states, residual)
-            self._maybe_add_hidden_state(
-                aux_hidden_states, idx + 1, hidden_states, residual
+            hidden_states, residual = layer.forward_input_norm(hidden_states, residual)
+            # A later PP stage's start boundary is captured by the stage before.
+            if idx in self.aux_hidden_state_layers and (
+                idx > self.start_layer or get_pp_group().is_first_rank
+            ):
+                aux_hidden_states.append(residual.clone())
+            hidden_states, residual = layer.forward_after_input_norm(
+                positions, hidden_states, residual
             )
 
         if not get_pp_group().is_last_rank:
+            # Under PP every FFN reduces its own output: no all-reduce is pending.
+            self._maybe_add_hidden_state(
+                aux_hidden_states, self.end_layer, hidden_states, residual
+            )
             return IntermediateTensors(
                 {
                     "hidden_states": hidden_states,
@@ -929,11 +950,13 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
             )
 
         if self.fuse_final_norm_allreduce:
-            hidden_states, _ = fused_allreduce_gemma_rms_norm(
+            hidden_states, residual = fused_allreduce_gemma_rms_norm(
                 hidden_states, residual, self.norm
             )
         else:
-            hidden_states, _ = self.norm(hidden_states, residual)
+            hidden_states, residual = self.norm(hidden_states, residual)
+        if self.end_layer in self.aux_hidden_state_layers:
+            aux_hidden_states.append(residual.clone())
 
         aux_hidden_states = remote_aux + aux_hidden_states
         if len(aux_hidden_states) > 0:
