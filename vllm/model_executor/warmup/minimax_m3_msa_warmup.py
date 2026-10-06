@@ -14,7 +14,7 @@ from vllm.models.minimax_m3.nvidia.msa_cutlass_sparse_decode import (
     uses_q8kv4_decode,
 )
 from vllm.models.minimax_m3.nvidia.sparse_attention_msa import (
-    MiniMaxM3SparseMSAImpl,
+    MiniMaxM3SparseMSABaseImpl,
 )
 from vllm.platforms import current_platform
 from vllm.tracing import instrument
@@ -37,7 +37,7 @@ def _msa_prebuild_kwargs(
     indexer = module.indexer.impl
     msa = (
         impl
-        if isinstance(impl, MiniMaxM3SparseMSAImpl)
+        if isinstance(impl, MiniMaxM3SparseMSABaseImpl)
         and module.kv_cache_dtype in _MSA_KV_CACHE_DTYPES
         else None
     )
@@ -71,9 +71,7 @@ def _msa_prebuild_kwargs(
         block_scale_shift=NVFP4_BLOCK_SCALE_SHIFT,
         sparse_decode=msa is not None and msa.use_cutlass_decode,
         sparse_prefill=attention,
-        prefill_backend=(
-            "q8kv4" if msa is not None and msa.use_nvfp4_kv else "cute_dsl"
-        ),
+        prefill_backend=msa.prefill_backend if msa is not None else "cute_dsl",
         device=torch.device("cuda", torch.accelerator.current_device_index()),
     )
 

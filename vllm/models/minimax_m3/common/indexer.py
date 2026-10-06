@@ -517,7 +517,7 @@ def select_indexer_impl_cls(
     On Blackwell (SM100) with ``topk_blocks == 16`` (the only width fmha_sm100's
     ``sparse_topk_select`` kernel supports), the fmha_sm100 score + top-k path is
     used for both bf16 and fp8 index caches. An nvfp4 index cache uses the MSA
-    Q8KV4/Q8KV8 paged indexers (SM100/SM103 only). Everything else falls back to
+    Q8KV4/Q8KV8 paged indexers (SM100/SM103/SM107 only). Everything else falls back to
     the Triton indexer, with fp8 restricted to CUDA platforms that advertise fp8
     support.
     """
@@ -538,10 +538,11 @@ def select_indexer_impl_cls(
             and (
                 current_platform.is_device_capability(100)
                 or current_platform.is_device_capability(103)
+                or current_platform.is_device_capability(107)
             )
         ):
             raise NotImplementedError(
-                "indexer_kv_dtype='nvfp4' requires an SM100 or SM103 GPU."
+                "indexer_kv_dtype='nvfp4' requires an SM100, SM103 or SM107 GPU."
             )
         from vllm.models.minimax_m3.nvidia.indexer_nvfp4 import (
             MiniMaxM3IndexerNvfp4Impl,

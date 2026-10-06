@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""NVFP4 index-cache indexer impl for MiniMax M3 (SM100/SM103).
+"""NVFP4 index-cache indexer impl for MiniMax M3 (SM100/SM103/SM107).
 
 The index-K side cache holds packed NVFP4 pages ``[num_blocks, 128, 72]`` (E2M1
 codes, then E4M3 block scales, no global scale) written by the fused

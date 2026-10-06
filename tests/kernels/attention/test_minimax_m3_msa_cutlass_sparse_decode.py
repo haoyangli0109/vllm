@@ -43,6 +43,7 @@ from vllm.models.minimax_m3.nvidia.sparse_attention_msa import (
     MiniMaxM3SparseMSAImpl,
     MiniMaxM3SparseMSAMetadataBuilder,
     MiniMaxM3SparseMSANvfp4Backend,
+    MiniMaxM3SparseMSANvfp4Impl,
 )
 from vllm.platforms import current_platform
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -197,7 +198,7 @@ def test_nvfp4_selects_msa_nvfp4_backend_and_requires_sm100(
         num_kv_heads=1,
     )
     assert backend_cls is MiniMaxM3SparseMSANvfp4Backend
-    assert impl_cls is MiniMaxM3SparseMSAImpl
+    assert impl_cls is MiniMaxM3SparseMSANvfp4Impl
     with pytest.raises(ValueError, match="nvfp4_4over6"):
         select_main_backend_and_impl_cls(
             topk_blocks=TOPK,
@@ -221,12 +222,13 @@ def test_nvfp4_selects_msa_nvfp4_backend_and_requires_sm100(
 @pytest.mark.parametrize(
     ("backend", "expected"),
     [
+        (None, "cutlass"),
         (AttentionBackendEnum.CUTLASS_MSA, "cutlass"),
         (AttentionBackendEnum.TRITON_MSA, "triton"),
     ],
 )
 def test_msa_attention_backend_alias(
-    backend: AttentionBackendEnum,
+    backend: AttentionBackendEnum | None,
     expected: str,
 ) -> None:
     config = AttentionConfig(backend=backend)
@@ -374,7 +376,7 @@ def test_msa_cutlass_plan_cache_keys_query_len(
     assert built_query_lens == [1, 2]
 
 
-def test_query_fp8_stays_valid_when_cutlass_plan_appears_on_replay(
+def test_query_stays_valid_when_cutlass_plan_appears_on_replay(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import vllm.envs as envs
@@ -422,20 +424,19 @@ def test_query_fp8_stays_valid_when_cutlass_plan_appears_on_replay(
     observed_ptrs: list[int] = []
 
     @eager_break_during_capture
-    def run_attention(query_fp8: torch.Tensor | None) -> None:
+    def run_attention(query: torch.Tensor) -> None:
         if impl.should_use_msa_decode(layer_name):
-            assert query_fp8 is not None
-            observed_ptrs.append(query_fp8.data_ptr())
+            assert query.dtype == torch.float8_e4m3fn
+            observed_ptrs.append(query.data_ptr())
 
     stream = torch.cuda.Stream()
 
     with torch.cuda.stream(stream), override_forward_context(forward_context):
         capture = BreakableCUDAGraphCapture()
         with capture:
-            query_fp8 = MiniMaxM3SparseAttention._allocate_query_fp8(attention, qkv)
-            if query_fp8 is not None:
-                query_fp8.zero_()
-            run_attention(query_fp8)
+            query = MiniMaxM3SparseAttention._allocate_query(attention, qkv)
+            query.zero_()
+            run_attention(query)
             qkv.zero_()
 
         assert capture.num_graphs == 2
@@ -963,8 +964,9 @@ def test_msa_prefill_nvfp4_matches_triton_on_dequantized_cache(
     num_kv_heads: int,
 ) -> None:
     """MSA prefill reads NVFP4 pages as their exact dequantized values,
-    including chunked prefill over cached context, on the Q8KV4 kernel with the
-    fp8 q the fused insert writes (the only q it writes on this path)."""
+    including chunked prefill over cached context, with the fp8 q the fused
+    insert writes (the only q it writes on this path): on the Q8KV4 kernel where
+    it serves the layout, otherwise on the CuTe-DSL NVFP4-KV kernel."""
     torch.manual_seed(0)
     q_lens = [300, 128, 77]
     seq_lens_list = [300, 640, 1100]
@@ -1050,16 +1052,12 @@ def test_msa_prefill_nvfp4_matches_triton_on_dequantized_cache(
         expected = MiniMaxM3SparseTritonImpl(**common).forward(
             layer, query, kv_reference, torch.empty_like(query)
         )
-        # As the model calls it for NVFP4: no bf16 q, only the fp8 one.
-        actual = MiniMaxM3SparseMSAImpl(**common, kv_cache_dtype="nvfp4").forward(
-            layer,
-            None,
-            kv_cache,
-            torch.zeros_like(query),
-            query_fp8=query_fp8,
+        # As the model calls it for NVFP4: the fp8 q is the only query.
+        actual = MiniMaxM3SparseMSANvfp4Impl(**common).forward(
+            layer, query_fp8, kv_cache, torch.zeros_like(query)
         )
     current_platform.synchronize()
-    # Q8KV4 prefill rounds each split's probabilities to E4M3, which moves a
+    # The fp8-q prefill rounds each split's probabilities to E4M3, which moves a
     # rare element past the BF16 tolerance.
     close = torch.isclose(actual, expected, atol=0.05, rtol=0.05)
     assert close.float().mean().item() > 1 - 1e-4
@@ -1067,30 +1065,31 @@ def test_msa_prefill_nvfp4_matches_triton_on_dequantized_cache(
 
 
 def test_nvfp4_kv_cache_never_takes_a_bf16_query() -> None:
-    """NVFP4 attention runs only on the Q8KV4 kernels: a head layout they
-    cannot serve is rejected at init instead of falling back to BF16 Q."""
+    """NVFP4 attention always reads an E4M3 q: decode on Q8KV4, which rejects a
+    head layout it cannot serve, and prefill on Q8KV4 or, where Q8KV4 cannot
+    serve the layout, the CuTe-DSL NVFP4-KV kernel."""
     assert uses_q8kv4_decode(kv_cache_dtype="nvfp4", num_q_heads=16, num_kv_heads=1)
     assert not uses_q8kv4_decode(
         kv_cache_dtype="fp8_e4m3", num_q_heads=16, num_kv_heads=1
     )
     with pytest.raises(ValueError, match="Q8KV4"):
         uses_q8kv4_decode(kv_cache_dtype="nvfp4", num_q_heads=4, num_kv_heads=1)
-    # 8 Q heads per KV head (TP8) decodes on Q8KV4 but cannot prefill on it.
-    with pytest.raises(ValueError, match="prefills only on the MSA Q8KV4"):
-        MiniMaxM3SparseMSAImpl(
-            num_heads=8,
-            head_size=HEAD_DIM,
-            scale=SM_SCALE,
-            num_kv_heads=1,
-            kv_cache_dtype="nvfp4",
-            topk_blocks=TOPK,
-            sparse_block_size=BLOCK_SIZE,
-        )
+    # 8 Q heads per KV head (TP8) decodes on Q8KV4; Q8KV4 cannot prefill it.
+    impl = MiniMaxM3SparseMSANvfp4Impl(
+        num_heads=8,
+        head_size=HEAD_DIM,
+        scale=SM_SCALE,
+        num_kv_heads=1,
+        topk_blocks=TOPK,
+        sparse_block_size=BLOCK_SIZE,
+    )
+    assert impl.use_cutlass_decode
+    assert impl.prefill_backend == "cute_dsl"
 
 
 def test_msa_triton_decode_fallback_reads_dequantized_query_fp8() -> None:
     """With CUTLASS decode on but not planned for the batch, the Triton decode
-    fallback attends with the dequantized fp8 q, the only q written."""
+    fallback attends with the dequantized E4M3 query."""
     torch.manual_seed(0)
     num_q_heads, num_kv_heads, q_scale = 16, 1, 0.5
     seq_lens_list = [257, 513, 129]
@@ -1154,12 +1153,6 @@ def test_msa_triton_decode_fallback_reads_dequantized_query_fp8() -> None:
         expected = MiniMaxM3SparseTritonImpl(**common).forward(
             layer, query, kv_cache, torch.empty_like(query)
         )
-        actual = impl.forward(
-            layer,
-            torch.full_like(query, float("nan")),
-            kv_cache,
-            torch.zeros_like(query),
-            query_fp8=query_fp8,
-        )
+        actual = impl.forward(layer, query_fp8, kv_cache, torch.zeros_like(query))
     current_platform.synchronize()
     torch.testing.assert_close(actual, expected, atol=0.02, rtol=0.02)

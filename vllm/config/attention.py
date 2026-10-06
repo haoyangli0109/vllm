@@ -40,8 +40,10 @@ class AttentionConfig:
     backend: AttentionBackendEnum | None = None
     """Attention backend to use. Use "auto" or None for automatic selection."""
 
-    minimax_m3_msa_decode_backend: MiniMaxM3MSADecodeBackend = "triton"
-    """Sparse decode kernel used by the MiniMax M3 MSA backend."""
+    minimax_m3_msa_decode_backend: MiniMaxM3MSADecodeBackend = "cutlass"
+    """Sparse decode kernel used by the MiniMax M3 MSA backend. "cutlass" falls
+    back to Triton where the CUTLASS kernel does not support the platform, KV
+    cache dtype, or head layout."""
 
     backend_per_kind: dict[str, AttentionBackendEnum] = field(default_factory=dict)
     """Per-KV-cache-group attention backend overrides, keyed by
@@ -84,7 +86,7 @@ class AttentionConfig:
     """Data type for the sparse-attention indexer K cache. "auto" picks the
     model's default (bf16 for MiniMax M3, fp8 for the DeepSeek sparse
     indexer). Quantized formats (fp8, mxfp4, nvfp4) require indexer kernel
-    support in the backend; MiniMax M3 supports nvfp4 on SM100/SM103 with at
+    support in the backend; MiniMax M3 supports nvfp4 on SM100/SM103/SM107 with at
     most 8 decode queries per request."""
 
     indexer_sparse_logits: bool = False

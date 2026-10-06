@@ -962,8 +962,9 @@ _requires_q8_indexer = pytest.mark.skipif(
     not (
         current_platform.is_device_capability(100)
         or current_platform.is_device_capability(103)
+        or current_platform.is_device_capability(107)
     ),
-    reason="The MSA Q8KV4/Q8KV8 indexers require SM100 or SM103.",
+    reason="The MSA Q8KV4/Q8KV8 indexers require SM100, SM103 or SM107.",
 )
 
 

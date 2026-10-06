@@ -104,7 +104,6 @@ from vllm.models.minimax_m3.nvidia.mega_moe import (
     MiniMaxM3NvFp4MegaMoEExperts,
     make_minimax_m3_mega_moe_expert_params_mapping,
 )
-from vllm.models.minimax_m3.nvidia.sparse_attention_msa import MiniMaxM3SparseMSAImpl
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
@@ -716,13 +715,12 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
         )
 
-    def _allocate_query_fp8(self, qkv: torch.Tensor) -> torch.Tensor | None:
-        if not getattr(self.impl, "use_cutlass_decode", False):
-            return None
-        return torch.empty(
+    def _allocate_query(self, qkv: torch.Tensor) -> torch.Tensor:
+        # CUTLASS decode reads an E4M3 query, so the insert emits only that.
+        fp8 = getattr(self.impl, "use_cutlass_decode", False)
+        return qkv.new_empty(
             (qkv.shape[0], self.q_size),
-            dtype=torch.float8_e4m3fn,
-            device=qkv.device,
+            dtype=torch.float8_e4m3fn if fp8 else qkv.dtype,
         )
 
     def forward(
@@ -759,11 +757,8 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
 
         main_slot_mapping = fwd_slot_mapping[self.layer_name]
         index_slot_mapping = fwd_slot_mapping[self.indexer.index_cache.prefix]
-        # With query_fp8, q is emitted only in fp8; the attend dequantizes it
-        # into ``q`` for the tokens that run on bf16-query kernels. An NVFP4
-        # cache runs none, so it gets no bf16 q.
-        query_fp8 = self._allocate_query_fp8(qkv)
-        q = None if self.use_nvfp4_kv else qkv.new_empty((num_tokens, self.q_size))
+        q = self._allocate_query(qkv)
+        q_is_fp8 = q.dtype == torch.float8_e4m3fn
         # index_q is e4m3 for the fp8 and nvfp4 index caches, else bf16; the
         # fused kernel emits fp8 directly when this buffer is e4m3.
         index_q = qkv.new_empty(
@@ -788,25 +783,24 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             self.kv_cache,
             self.indexer.index_cache.kv_cache,
             self.kv_cache.size(2),  # paged-cache block size
-            q if query_fp8 is None else None,
+            None if q_is_fp8 else q,
             index_q,
             self.kv_cache_dtype,
-            q_fp8_out=query_fp8,
+            q_fp8_out=q if q_is_fp8 else None,
             q_fp8_scale=self._q_scale_float,
             kv_k_scale=self._k_scale if self.use_nvfp4_kv else None,
             kv_v_scale=self._v_scale if self.use_nvfp4_kv else None,
         )
 
         output = qkv.new_empty((num_tokens, self.q_size))
-        attn_output = self._run_attention(q, query_fp8, index_q, output)
+        attn_output = self._run_attention(q, index_q, output)
         output, _ = self.o_proj(attn_output)
         return output
 
     @eager_break_during_capture
     def _run_attention(
         self,
-        query: torch.Tensor | None,
-        query_fp8: torch.Tensor | None,
+        query: torch.Tensor,
         index_query: torch.Tensor,
         output: torch.Tensor,
     ) -> torch.Tensor:
@@ -814,19 +808,7 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         # metadata and can't be captured into a cudagraph. The indexer writes its
         # top-k into the shared ``topk_indices_buffer``; the attend reads it back.
         self.indexer(index_query)
-        if query is None:
-            # Only the MSA impl serves NVFP4, and it reads only query_fp8.
-            assert isinstance(self.impl, MiniMaxM3SparseMSAImpl)
-            return self.impl.forward(
-                self, None, self.kv_cache, output, query_fp8=query_fp8
-            )
-        return self.impl.forward(
-            self,
-            query,
-            self.kv_cache,
-            output,
-            query_fp8=query_fp8,
-        )
+        return self.impl.forward(self, query, self.kv_cache, output)
 
 
 class MiniMaxM3DecoderLayer(nn.Module):

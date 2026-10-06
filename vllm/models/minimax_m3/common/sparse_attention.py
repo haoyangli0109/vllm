@@ -428,10 +428,11 @@ class MiniMaxM3SparseImpl(AttentionImplBase[MiniMaxM3SparseMetadata]):
         query: torch.Tensor,
         kv_cache: torch.Tensor,
         output: torch.Tensor,
-        *,
-        query_fp8: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Attend the queries to the indexer-selected blocks. Per kernel.
+
+        ``query`` is E4M3 for impls with ``use_cutlass_decode``, else the model
+        dtype.
 
         The indexer has already written the top-k block ids into
         ``layer.topk_indices_buffer`` (decode at ``[:, :nd]``, prefill at
@@ -452,8 +453,6 @@ class MiniMaxM3SparseTritonImpl(MiniMaxM3SparseImpl):
         query: torch.Tensor,
         kv_cache: torch.Tensor,
         output: torch.Tensor,
-        *,
-        query_fp8: torch.Tensor | None = None,
     ) -> torch.Tensor:
         attn_metadata = get_forward_context().attn_metadata
         if not isinstance(attn_metadata, dict):
@@ -579,10 +578,11 @@ def select_main_backend_and_impl_cls(
             MiniMaxM3SparseMSABackend,
             MiniMaxM3SparseMSAImpl,
             MiniMaxM3SparseMSANvfp4Backend,
+            MiniMaxM3SparseMSANvfp4Impl,
         )
 
         if use_nvfp4:
-            return MiniMaxM3SparseMSANvfp4Backend, MiniMaxM3SparseMSAImpl
+            return MiniMaxM3SparseMSANvfp4Backend, MiniMaxM3SparseMSANvfp4Impl
         return MiniMaxM3SparseMSABackend, MiniMaxM3SparseMSAImpl
     return MiniMaxM3SparseBackend, MiniMaxM3SparseTritonImpl
 
