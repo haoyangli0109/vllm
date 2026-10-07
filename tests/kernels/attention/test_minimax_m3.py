@@ -1159,8 +1159,6 @@ def test_nvfp4_indexer_impl_matches_reference(
         builder = MiniMaxM3IndexerNvfp4MetadataBuilder(
             spec, [impl.index_cache.prefix], vllm_config, device
         )
-    # Every TP layout (1, 2 or 4 index heads per rank) decodes in one launch.
-    assert builder.decode_num_heads == num_idx_heads
     index_spec = impl.index_cache.get_kv_cache_spec(vllm_config)
     assert index_spec.page_size_bytes == BLOCK_SIZE * _NVFP4_PAGE_WIDTH
     assert index_spec.dtype == torch.uint8
@@ -1209,7 +1207,7 @@ def test_nvfp4_indexer_impl_matches_reference(
 
 
 @_requires_q8_indexer
-@pytest.mark.parametrize("decode_query_len", [1, 8])
+@pytest.mark.parametrize("decode_query_len", [1, 3, 8])
 @pytest.mark.parametrize("num_idx_heads", [1, 2, 4])
 def test_nvfp4_indexer_decode_cuda_graph_replay(
     decode_query_len, num_idx_heads, monkeypatch, workspace_init
@@ -1217,7 +1215,8 @@ def test_nvfp4_indexer_decode_cuda_graph_replay(
     """A full CUDA graph captures the decode indexer once per padded batch
     size; re-planning a later step (new lengths, pages and keys, one
     zero-length padding request) outside capture and replaying must give that
-    step's top-k, which fails if any captured tensor was re-allocated."""
+    step's top-k, which fails if any captured tensor was re-allocated. The
+    decode reads index_q and writes the top-k in place, copying nothing."""
     import vllm.models.minimax_m3.common.indexer as indexer_mod
     from tests.v1.attention.utils import (
         BatchSpec,
@@ -1296,6 +1295,18 @@ def test_nvfp4_indexer_decode_cuda_graph_replay(
     common, md = step([2305, 2561, 2944, 700], [decode_query_len] * num_reqs)
     with set_forward_context({impl.index_cache.prefix: md}, vllm_config):
         impl(index_q)
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ]
+        ) as prof:
+            impl(index_q)
+            torch.accelerator.synchronize()
+        copies = [
+            e.name for e in prof.events() if "Memcpy" in e.name or "copy_" in e.name
+        ]
+        assert not copies, copies
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             impl(index_q)

@@ -9,11 +9,12 @@ of ``fmha_sm100`` with fused top-k, which write 15 score-ranked history pages
 plus the query's local page last (``init_blocks=0, local_blocks=1``) as
 logical block ids:
 
-* Decode scores the NVFP4 pages with the Q8KV4 decode indexer. It takes exactly
-  8 queries per request, so shorter uniform decodes are right-aligned into
-  zero-padded 8-query tiles. Uniform decode batches are captured in full CUDA
-  graphs, so each padded batch size gets its own CUDA-graph wrapper whose
-  buffers never move; the builder re-plans it outside capture every step.
+* Decode scores the NVFP4 pages with the Q8KV4 decode indexer, which reads the
+  1..8 queries of each request in place (they take the last slots of its
+  8-query tile) and writes their top-k straight into the shared buffer.
+  Uniform decode batches are captured in full CUDA graphs, so each padded
+  batch size and query length gets its own CUDA-graph wrapper whose buffers
+  never move; the builder re-plans it outside capture every step.
 * Prefill has no NVFP4 kernel. Each layer dequantizes the history pages of the
   prefill requests into compact FP8 workspace pages (what the decode kernel
   scores) and runs the Q8KV8 prefill indexer on them, in request chunks whose
@@ -94,10 +95,6 @@ class MiniMaxM3IndexerNvfp4Backend(MiniMaxM3IndexerBackend):
 @dataclass
 class MiniMaxM3IndexerNvfp4DecodeMetadata:
     wrapper: Any  # planned CUDA-graph BatchDecodeIndexerQ8KV4Wrapper
-    # [num_reqs, 8, wrapper heads, 128] e4m3, zero outside the query slots;
-    # owned by the wrapper's batch size so captured copies always hit the same
-    # address.
-    query_tile: torch.Tensor
     num_reqs: int  # includes zero-length full-CUDA-graph padding requests
     query_len: int  # uniform, <= DECODE_QUERY_LEN
 
@@ -143,22 +140,22 @@ class MiniMaxM3IndexerNvfp4MetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
                 f"{self.max_decode_query_len} (use num_speculative_tokens <= "
                 f"{DECODE_QUERY_LEN - 1})."
             )
+        if self.num_index_heads not in DECODE_NUM_HEADS:
+            raise NotImplementedError(
+                "The MiniMax M3 NVFP4 indexer serves "
+                f"{DECODE_NUM_HEADS} index heads per rank, got "
+                f"{self.num_index_heads}."
+            )
         self.max_gather_pages = max_gather_pages(vllm_config)
-        # Heads per decode launch; other head counts decode one head at a time.
-        self.decode_num_heads = (
-            self.num_index_heads if self.num_index_heads in DECODE_NUM_HEADS else 1
-        )
-        # Decode wrapper + query tile per padded decode batch size.
-        self.decode_wrappers: dict[int, tuple[Any, torch.Tensor]] = {}
+        # Decode wrapper per padded decode batch size and query length.
+        self.decode_wrappers: dict[tuple[int, int], Any] = {}
 
-    def _decode_wrapper(
-        self, num_reqs: int, num_pages: int
-    ) -> tuple[Any, torch.Tensor]:
-        entry = self.decode_wrappers.get(num_reqs)
-        if entry is None:
+    def _decode_wrapper(self, num_reqs: int, query_len: int, num_pages: int) -> Any:
+        wrapper = self.decode_wrappers.get((num_reqs, query_len))
+        if wrapper is None:
             decode_wrapper_cls, _ = _msa_indexers()
-            wrapper = decode_wrapper_cls(
-                num_heads=self.decode_num_heads,
+            wrapper = self.decode_wrappers[num_reqs, query_len] = decode_wrapper_cls(
+                num_heads=self.num_index_heads,
                 use_cuda_graph=True,
                 block_table_buffer=torch.empty(
                     num_reqs, num_pages, dtype=torch.int32, device=self.device
@@ -167,16 +164,7 @@ class MiniMaxM3IndexerNvfp4MetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
                     num_reqs, dtype=torch.int32, device=self.device
                 ),
             )
-            query_tile = torch.zeros(
-                num_reqs,
-                DECODE_QUERY_LEN,
-                self.decode_num_heads,
-                HEAD_DIM,
-                dtype=torch.float8_e4m3fn,
-                device=self.device,
-            )
-            entry = self.decode_wrappers[num_reqs] = (wrapper, query_tile)
-        return entry
+        return wrapper
 
     def build(
         self,
@@ -208,14 +196,14 @@ class MiniMaxM3IndexerNvfp4MetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
             query_len = int(query_lens_cpu[0])
             assert torch.all((query_lens_cpu == query_len) | (query_lens_cpu == 0))
             num_pages = min(block_table.shape[1], MAX_PAGES)
-            wrapper, query_tile = self._decode_wrapper(num_decodes, num_pages)
+            wrapper = self._decode_wrapper(num_decodes, query_len, num_pages)
             wrapper.plan(
                 block_table[:num_decodes, :num_pages].contiguous(),
                 seq_lens[:num_decodes],
+                query_len=query_len,
             )
             decode = MiniMaxM3IndexerNvfp4DecodeMetadata(
                 wrapper=wrapper,
-                query_tile=query_tile,
                 num_reqs=num_decodes,
                 query_len=query_len,
             )
@@ -387,7 +375,7 @@ class MiniMaxM3IndexerNvfp4Impl(MiniMaxM3IndexerImpl):
         if md.decode_q8kv4 is not None:
             d = md.decode_q8kv4
             rows = d.num_reqs * d.query_len
-            self._decode(index_q[:rows], kv, d, buf[:rows])
+            d.wrapper.run(index_q[:rows], kv, out=buf[:rows])
         for chunk in md.prefill_chunks:
             self._prefill(
                 index_q[nd + chunk.token_start : nd + chunk.token_end],
@@ -396,32 +384,6 @@ class MiniMaxM3IndexerNvfp4Impl(MiniMaxM3IndexerImpl):
                 buf[nd + chunk.token_start : nd + chunk.token_end],
             )
         return None, None
-
-    def _decode(
-        self,
-        index_q: torch.Tensor,
-        kv: torch.Tensor,
-        d: MiniMaxM3IndexerNvfp4DecodeMetadata,
-        out: torch.Tensor,
-    ) -> None:
-        query_len = d.query_len
-        launch_heads = d.query_tile.shape[2]
-        if query_len == DECODE_QUERY_LEN and launch_heads == self.num_index_heads:
-            d.wrapper.run(index_q, kv, out=out)
-            return
-        # Query i of a request sits at seq_len - 8 + i, so the real queries
-        # take the last query_len slots; the zero slots' rows are dropped.
-        pad = DECODE_QUERY_LEN - query_len
-        q_tile = d.query_tile
-        for first in range(0, self.num_index_heads, launch_heads):
-            heads = slice(first, first + launch_heads)
-            q_tile[:, pad:] = index_q[:, heads].view(
-                d.num_reqs, query_len, launch_heads, -1
-            )
-            topk = d.wrapper.run(q_tile.view(-1, launch_heads, HEAD_DIM), kv)
-            out[:, heads] = topk.view(d.num_reqs, DECODE_QUERY_LEN, launch_heads, -1)[
-                :, pad:
-            ].reshape(-1, launch_heads, TOPK_BLOCKS)
 
     def _prefill(
         self,
