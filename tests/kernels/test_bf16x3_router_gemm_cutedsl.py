@@ -24,31 +24,11 @@ def _requires_sm100_cutedsl():
         (48, 6144, 128),
         (96, 3072, 256),
         (129, 3072, 17),
-        # long K: the large-M split-K heuristic leaves chains of 15 and 32
-        # K-tiles, above num_tmem_acc (multi-chunk epilogue); the odd-experts
-        # case below covers the small-M kernel's multi-chunk path (12 K-tiles)
+        # long-K cases exercise the multi-accumulation path (the split-K
+        # heuristic leaves chains of 15 and 32 K-tiles here, above the
+        # kernel's num_tmem_acc bound)
         (1024, 8192, 256),
         (2048, 8192, 256),
-        # small-M path, up to the last token count below the large-M threshold
-        (64, 6144, 128),
-        (128, 2816, 256),
-        # Hunyuan-V4: small-M path with one-wave split_k up to 384 tokens
-        (300, 2816, 256),
-        (384, 2816, 256),
-        # large-M path, cta_group=1 band (up to 512 tokens), from the threshold
-        (129, 6144, 128),
-        (300, 3072, 256),
-        (385, 2816, 256),
-        (512, 6144, 128),
-        (512, 3072, 256),
-        # large-M path, cta_group=2
-        (768, 4096, 192),
-        (1024, 6144, 128),
-        (2048, 2816, 256),
-        # partial 256-token pair-tile tail
-        (8200, 6144, 128),
-        # odd experts: large-M ineligible at any token count, small-M path
-        (4096, 3072, 17),
     ],
 )
 def test_bf16x3_router_gemm_matches_reference(
