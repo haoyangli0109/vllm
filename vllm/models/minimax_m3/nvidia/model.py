@@ -28,6 +28,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from vllm.forward_context import get_forward_context, is_forward_context_available
+from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMulWithClamp
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention.attention import set_default_quant_scales
@@ -40,8 +41,21 @@ from vllm.model_executor.layers.fused_moe import (
     GateLinear,
     fused_moe_make_expert_params_mapping,
 )
+from vllm.model_executor.layers.fused_moe.experts.trtllm_nvfp4_moe import (
+    TrtLlmNvFp4ExpertsModular,
+    TrtLlmNvFp4ExpertsMonolithic,
+)
+from vllm.model_executor.layers.fused_moe.moe_output import (
+    MoEOutput,
+    UnfinalizedMoEOutput,
+)
 from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
     fused_topk_bias,
+)
+from vllm.model_executor.layers.fused_moe.runner.moe_runner import _unpack
+from vllm.model_executor.layers.fusion.quant_activation import (
+    QuantizedActivation,
+    get_input_quant_key,
 )
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
@@ -51,6 +65,7 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp8Dynamic
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -104,6 +119,11 @@ from vllm.models.minimax_m3.nvidia.mega_moe import (
     MiniMaxM3NvFp4MegaMoEExperts,
     make_minimax_m3_mega_moe_expert_params_mapping,
 )
+from vllm.models.minimax_m3.nvidia.ops.finalize_allreduce_norm import (
+    finalize_allreduce_gemma_rms_norm_mxfp8,
+    init_fused_moe_finalize,
+    supports_fused_moe_finalize,
+)
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
@@ -113,6 +133,13 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     get_kv_quant_mode,
 )
+
+logger = init_logger(__name__)
+
+# Largest batch whose MoE top-k finalize runs inside the next layer's fused
+# all-reduce + input norm + MXFP8 quantization. Larger batches finalize in the
+# MoE and use the regular fused all-reduce + norm.
+FUSED_MOE_FINALIZE_MAX_TOKENS = 32
 
 
 def _sparse_attention_layer_ids(config: PreTrainedConfig) -> set[int]:
@@ -364,6 +391,40 @@ class MiniMaxM3MoE(nn.Module):
         if self.use_mega_moe:
             return not self.reduce_results
         return self.experts.moe_config.skip_final_all_reduce
+
+    def defer_finalize(self, max_num_tokens: int) -> bool:
+        """Leave the routed top-k reduction of calls up to ``max_num_tokens``
+        to the consumer; return whether the experts accepted.
+
+        Only the TRTLLM-Gen NVFP4 experts can stop after GEMM2.
+        """
+        if self.use_mega_moe:
+            return False
+        experts_cls = getattr(
+            self.experts.routed_experts.quant_method, "experts_cls", None
+        )
+        if experts_cls not in (TrtLlmNvFp4ExpertsMonolithic, TrtLlmNvFp4ExpertsModular):
+            return False
+        moe_config = self.experts.moe_config
+        moe_config.defer_moe_finalize(max_num_tokens)
+        return moe_config.use_deferred_moe_finalize
+
+    def defers_finalize(self, num_tokens: int) -> bool:
+        return (
+            not self.use_mega_moe
+            and self.experts.moe_config.should_defer_moe_finalize(num_tokens)
+        )
+
+    def forward_unfinalized(self, hidden_states: torch.Tensor) -> MoEOutput:
+        """``forward`` with the routed top-k reduction and all-reduce left open."""
+        router_logits, _ = self.gate(hidden_states)
+        # The runner's custom op returns tensors only, so run its body directly.
+        shared_output, routed = _unpack(
+            self.experts._forward_impl(hidden_states, router_logits, hidden_states)
+        )
+        assert shared_output is not None
+        assert isinstance(routed, UnfinalizedMoEOutput)
+        return MoEOutput(routed=routed, shared_output=shared_output)
 
     def finalize_mega_moe_weights(self) -> None:
         if not self.use_mega_moe:
@@ -726,7 +787,7 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
     def forward(
         self,
         positions: torch.Tensor,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | QuantizedActivation,
     ) -> torch.Tensor:
         # Single fused projection emitting [q | k | v | index_q | index_k].
         qkv, _ = self.qkv_proj(hidden_states)
@@ -906,15 +967,25 @@ class MiniMaxM3DecoderLayer(nn.Module):
     def forward(
         self,
         positions: torch.Tensor,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | MoEOutput,
         residual: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor | MoEOutput, torch.Tensor]:
         hidden_states, residual = self.forward_input_norm(hidden_states, residual)
         return self.forward_after_input_norm(positions, hidden_states, residual)
 
     def forward_input_norm(
-        self, hidden_states: torch.Tensor, residual: torch.Tensor | None
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self, hidden_states: torch.Tensor | MoEOutput, residual: torch.Tensor | None
+    ) -> tuple[torch.Tensor | QuantizedActivation, torch.Tensor]:
+        if isinstance(hidden_states, MoEOutput):
+            # The preceding MoE left a small batch unfinalized: finalize,
+            # all-reduce, norm and MXFP8-quantize the qkv_proj input at once.
+            assert residual is not None
+            return finalize_allreduce_gemma_rms_norm_mxfp8(
+                hidden_states,
+                residual,
+                self.input_layernorm.weight,
+                self.input_layernorm.variance_epsilon,
+            )
         if self.fuse_input_allreduce and residual is not None:
             hidden_states, residual = fused_allreduce_gemma_rms_norm(
                 hidden_states, residual, self.input_layernorm
@@ -930,9 +1001,9 @@ class MiniMaxM3DecoderLayer(nn.Module):
     def forward_after_input_norm(
         self,
         positions: torch.Tensor,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | QuantizedActivation,
         residual: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor | MoEOutput, torch.Tensor]:
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -941,6 +1012,11 @@ class MiniMaxM3DecoderLayer(nn.Module):
         hidden_states, residual = fused_allreduce_gemma_rms_norm(
             hidden_states, residual, self.post_attention_layernorm
         )
+        if self.is_moe_layer and self.block_sparse_moe.defers_finalize(
+            hidden_states.shape[0]
+        ):
+            # The next layer's input norm finalizes it with the all-reduce.
+            return self.block_sparse_moe.forward_unfinalized(hidden_states), residual
         ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
         hidden_states = ffn(hidden_states)
         return hidden_states, residual
@@ -1028,6 +1104,47 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
             layer.fuse_input_allreduce = idx > 0 and prev_defers
             prev_defers = layer.ffn_all_reduce_deferred
         self.fuse_final_norm_allreduce = prev_defers
+        if supports_fused_moe_finalize(vllm_config):
+            self._init_fused_moe_finalize()
+
+    def _init_fused_moe_finalize(self) -> None:
+        """Let small batches leave a MoE's top-k finalize to the next layer's
+        input norm, which already fuses the TP all-reduce, and have it quantize
+        the normed rows to the MXFP8 its qkv_proj reads.
+
+        Each MoE whose successor can take the output gets the hint here, and
+        ``defers_finalize`` decides per call. The final norm feeds the LM head
+        in BF16, so the last layer keeps its own finalize. Builds a collective
+        kernel: every TP rank decides alike.
+        """
+        layers = self.layers[self.start_layer : self.end_layer]
+        deferring = [
+            layer.block_sparse_moe
+            for layer, successor in zip(layers, layers[1:])
+            if layer.is_moe_layer
+            and successor.fuse_input_allreduce
+            and get_input_quant_key(successor.self_attn.qkv_proj) == kMxfp8Dynamic
+            and layer.block_sparse_moe.defer_finalize(FUSED_MOE_FINALIZE_MAX_TOKENS)
+        ]
+        if not deferring:
+            return
+        # The modular experts return the router's FP32 routing weights; the
+        # monolithic kernel routes itself in BF16.
+        experts_cls = getattr(
+            deferring[0].experts.routed_experts.quant_method, "experts_cls", None
+        )
+        init_fused_moe_finalize(
+            hidden_size=self.config.hidden_size,
+            max_num_tokens=FUSED_MOE_FINALIZE_MAX_TOKENS,
+            top_k=self.config.num_experts_per_tok,
+            fp32_weights=experts_cls is TrtLlmNvFp4ExpertsModular,
+        )
+        logger.info_once(
+            "MiniMax M3: MoE top-k finalize fused into the next all-reduce + "
+            "input norm + MXFP8 quantization for up to %d tokens (%d layers).",
+            FUSED_MOE_FINALIZE_MAX_TOKENS,
+            len(deferring),
+        )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
