@@ -965,8 +965,8 @@ def test_msa_prefill_nvfp4_matches_triton_on_dequantized_cache(
 ) -> None:
     """MSA prefill reads NVFP4 pages as their exact dequantized values,
     including chunked prefill over cached context, with the fp8 q the fused
-    insert writes (the only q it writes on this path): on the Q8KV4 kernel where
-    it serves the layout, otherwise on the CuTe-DSL NVFP4-KV kernel."""
+    insert writes (the only q it writes on this path), on the CUTLASS Q8KV4
+    kernel."""
     torch.manual_seed(0)
     q_lens = [300, 128, 77]
     seq_lens_list = [300, 640, 1100]
@@ -1065,26 +1065,50 @@ def test_msa_prefill_nvfp4_matches_triton_on_dequantized_cache(
 
 
 def test_nvfp4_kv_cache_never_takes_a_bf16_query() -> None:
-    """NVFP4 attention always reads an E4M3 q: decode on Q8KV4, which rejects a
-    head layout it cannot serve, and prefill on Q8KV4 or, where Q8KV4 cannot
-    serve the layout, the CuTe-DSL NVFP4-KV kernel."""
+    """NVFP4 attention always reads an E4M3 q on the CUTLASS Q8KV4 kernels, and
+    a head layout either kernel cannot serve fails at init."""
     assert uses_q8kv4_decode(kv_cache_dtype="nvfp4", num_q_heads=16, num_kv_heads=1)
     assert not uses_q8kv4_decode(
         kv_cache_dtype="fp8_e4m3", num_q_heads=16, num_kv_heads=1
     )
     with pytest.raises(ValueError, match="Q8KV4"):
         uses_q8kv4_decode(kv_cache_dtype="nvfp4", num_q_heads=4, num_kv_heads=1)
-    # 8 Q heads per KV head (TP8) decodes on Q8KV4; Q8KV4 cannot prefill it.
-    impl = MiniMaxM3SparseMSANvfp4Impl(
-        num_heads=8,
-        head_size=HEAD_DIM,
-        scale=SM_SCALE,
-        num_kv_heads=1,
-        topk_blocks=TOPK,
-        sparse_block_size=BLOCK_SIZE,
-    )
-    assert impl.use_cutlass_decode
-    assert impl.prefill_backend == "cute_dsl"
+    # 8 Q heads per KV head (TP8) decodes on Q8KV4, but Q8KV4 cannot prefill it.
+    with pytest.raises(ValueError, match="CUTLASS Q8KV4 prefill"):
+        MiniMaxM3SparseMSANvfp4Impl(
+            num_heads=8,
+            head_size=HEAD_DIM,
+            scale=SM_SCALE,
+            num_kv_heads=1,
+            topk_blocks=TOPK,
+            sparse_block_size=BLOCK_SIZE,
+        )
+
+
+@pytest.mark.parametrize(
+    "architecture",
+    ["MiniMaxM3SparseForCausalLM", "MiniMaxM3SparseForConditionalGeneration"],
+)
+def test_nvfp4_kv_cache_with_tp8_fails_at_config_time(architecture: str) -> None:
+    """An NVFP4 KV cache needs 16 query heads per KV head on each rank: the config
+    check rejects TP8 (8 per KV head) before the workers start; TP1/2/4 and other
+    KV cache dtypes pass."""
+    from vllm.model_executor.models.config import MODELS_CONFIG_MAP
+
+    def vllm_config(tensor_parallel_size: int, cache_dtype: str) -> SimpleNamespace:
+        text_config = SimpleNamespace(num_attention_heads=64, num_key_value_heads=4)
+        return SimpleNamespace(
+            model_config=SimpleNamespace(hf_text_config=text_config),
+            cache_config=SimpleNamespace(cache_dtype=cache_dtype),
+            parallel_config=SimpleNamespace(tensor_parallel_size=tensor_parallel_size),
+        )
+
+    verify = MODELS_CONFIG_MAP[architecture].verify_and_update_config
+    for tensor_parallel_size in (1, 2, 4):
+        verify(vllm_config(tensor_parallel_size, "nvfp4"))
+    verify(vllm_config(8, "fp8"))
+    with pytest.raises(ValueError, match="NVFP4 KV cache with tensor_parallel_size=8"):
+        verify(vllm_config(8, "nvfp4"))
 
 
 def test_msa_triton_decode_fallback_reads_dequantized_query_fp8() -> None:

@@ -8,9 +8,8 @@ CUTLASS ``fmha_sm100`` path by default for regular decode and speculative
 verification, with Triton split-K as the fallback.
 
 ``MiniMaxM3SparseMSANvfp4Impl`` serves NVFP4 KV caches, reading vLLM's packed
-pages directly with only the E4M3 query: decode on the CUTLASS Q8KV4 kernel,
-prefill on the Q8KV4 kernel where it serves the layout (SM100/SM103) and on the
-CuTe-DSL NVFP4-KV kernel otherwise.
+pages directly with only the E4M3 query: decode and prefill both run the CUTLASS
+Q8KV4 kernels.
 """
 
 import functools
@@ -406,13 +405,12 @@ class MiniMaxM3SparseMSAImpl(MiniMaxM3SparseMSABaseImpl):
 class MiniMaxM3SparseMSANvfp4Impl(MiniMaxM3SparseMSABaseImpl):
     """MSA block-sparse attention over an NVFP4 KV cache, SM100 family only.
 
-    Every kernel reads the E4M3 query; there is no BF16-query kernel and no
-    Triton fallback.
-    Decode runs the CUTLASS Q8KV4 kernel; prefill runs the Q8KV4 kernel where
-    it serves the layout, else the CuTe-DSL NVFP4-KV kernel.
+    Decode and prefill run the CUTLASS Q8KV4 kernels, which read the E4M3
+    query; there is no BF16-query kernel and no Triton fallback.
     """
 
     use_cutlass_decode = True
+    prefill_backend = "q8kv4"
 
     def __init__(
         self,
@@ -457,11 +455,12 @@ class MiniMaxM3SparseMSANvfp4Impl(MiniMaxM3SparseMSABaseImpl):
         blocker = _q8kv4_prefill_blocker(
             self.num_heads, self.num_kv_heads, self.block_size, self.topk_blocks
         )
-        self.prefill_backend = "q8kv4" if blocker is None else "cute_dsl"
-        logger.info_once(
-            "MiniMax M3 NVFP4 MSA: CUTLASS Q8KV4 decode, %s prefill",
-            "Q8KV4" if blocker is None else "CuTe-DSL",
-        )
+        if blocker is not None:
+            raise ValueError(
+                "MiniMax M3 NVFP4 KV cache requires the CUTLASS Q8KV4 prefill, "
+                f"which cannot serve this layout or device: {blocker}"
+            )
+        logger.info_once("MiniMax M3 NVFP4 MSA: CUTLASS Q8KV4 decode and prefill")
         # NVFP4_BLOCK_SCALE_SHIFT assumes unit global scales; checked on the
         # first forward, once the checkpoint's KV scales are loaded.
         self._check_global_scales = True
@@ -526,62 +525,28 @@ class MiniMaxM3SparseMSANvfp4Impl(MiniMaxM3SparseMSABaseImpl):
             )
 
         if main_md.num_prefills > 0:
+            from vllm.third_party.fmha_sm100.prefill_q8kv4 import run_prefill
+
             p = main_md.prefill
             assert p is not None
-            k2q_row_ptr, k2q_q_indices, schedule = self._build_prefill_csr(
-                topk, nd, num_tokens, p
-            )
+            k2q_row_ptr, _, schedule = self._build_prefill_csr(topk, nd, num_tokens, p)
             k_data, k_sf, v_data, v_sf = nvfp4_kv_cache_views(kv_cache)
-            if self.prefill_backend == "q8kv4":
-                from vllm.third_party.fmha_sm100.prefill_q8kv4 import run_prefill
-
-                run_prefill(
-                    q_fp8[nd:],
-                    (k_data, v_data),
-                    (k_sf, v_sf),
-                    kv_indices=p.block_table,
-                    kv_indptr=None,
-                    cu_seqlens_q=p.cu_seqlens_q,
-                    cu_seqlens_k=p.cu_seqlens_k,
-                    k2q_row_ptr=k2q_row_ptr,
-                    schedule=schedule,
-                    sm_scale=self.scale * q_scale_float,
-                    topk=self.topk_blocks,
-                    seqused_k=p.seq_lens,
-                    k_global_scale=k_scale,
-                    v_global_scale=v_scale,
-                    block_scale_shift=NVFP4_BLOCK_SCALE_SHIFT,
-                    out=out[nd:],
-                )
-            else:
-                from vllm.third_party.fmha_sm100.sparse import (
-                    sparse_atten_nvfp4_kv_func,
-                )
-
-                # The E4M3 query selects the kernel's FP8-Q path; its scale
-                # folds into the softmax scale.
-                sparse_atten_nvfp4_kv_func(
-                    q_fp8[nd:],
-                    k_data,
-                    v_data,
-                    k_sf,
-                    v_sf,
-                    k_scale,
-                    v_scale,
-                    k2q_row_ptr,
-                    k2q_q_indices,
-                    self.topk_blocks,
-                    cu_seqlens_q=p.cu_seqlens_q,
-                    cu_seqlens_k=p.cu_seqlens_k,
-                    max_seqlen_q=p.max_query_len,
-                    max_seqlen_k=p.max_seq_len,
-                    blk_kv=SPARSE_BLOCK_SIZE,
-                    causal=True,
-                    softmax_scale=self.scale * q_scale_float,
-                    page_table=p.block_table,
-                    seqused_k=p.seq_lens,
-                    schedule=schedule,
-                    out=out[nd:],
-                    kv_layout="vllm",
-                )
+            run_prefill(
+                q_fp8[nd:],
+                (k_data, v_data),
+                (k_sf, v_sf),
+                kv_indices=p.block_table,
+                kv_indptr=None,
+                cu_seqlens_q=p.cu_seqlens_q,
+                cu_seqlens_k=p.cu_seqlens_k,
+                k2q_row_ptr=k2q_row_ptr,
+                schedule=schedule,
+                sm_scale=self.scale * q_scale_float,
+                topk=self.topk_blocks,
+                seqused_k=p.seq_lens,
+                k_global_scale=k_scale,
+                v_global_scale=v_scale,
+                block_scale_shift=NVFP4_BLOCK_SCALE_SHIFT,
+                out=out[nd:],
+            )
         return output
