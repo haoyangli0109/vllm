@@ -17,7 +17,7 @@ else()
   FetchContent_Declare(
     fmha_sm100
     GIT_REPOSITORY https://github.com/vllm-project/MSA.git
-    GIT_TAG ed4e40efcb5895aba1a3554d62cd1dcaf77920cb
+    GIT_TAG e4419766e8a0a6a5976712929b1ac858a6919192
     GIT_PROGRESS TRUE
     CONFIGURE_COMMAND ""
     BUILD_COMMAND ""

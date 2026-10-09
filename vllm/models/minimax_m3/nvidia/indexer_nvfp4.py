@@ -150,19 +150,25 @@ class MiniMaxM3IndexerNvfp4MetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
         # Decode wrapper per padded decode batch size and query length.
         self.decode_wrappers: dict[tuple[int, int], Any] = {}
 
-    def _decode_wrapper(self, num_reqs: int, query_len: int, num_pages: int) -> Any:
+    def _decode_wrapper(
+        self, block_table: torch.Tensor, seq_lens: torch.Tensor, query_len: int
+    ) -> Any:
+        num_reqs = seq_lens.shape[0]
         wrapper = self.decode_wrappers.get((num_reqs, query_len))
         if wrapper is None:
+            # The runner's block table and seq_lens are persistent buffers, so
+            # the wrapper reads them in place and plan() copies nothing. A
+            # strided (width-capped) block table gets its own buffer.
+            if not block_table.is_contiguous():
+                block_table = torch.empty(
+                    block_table.shape, dtype=torch.int32, device=self.device
+                )
             decode_wrapper_cls, _ = _msa_indexers()
             wrapper = self.decode_wrappers[num_reqs, query_len] = decode_wrapper_cls(
                 num_heads=self.num_index_heads,
                 use_cuda_graph=True,
-                block_table_buffer=torch.empty(
-                    num_reqs, num_pages, dtype=torch.int32, device=self.device
-                ),
-                seq_lens_buffer=torch.empty(
-                    num_reqs, dtype=torch.int32, device=self.device
-                ),
+                block_table_buffer=block_table,
+                seq_lens_buffer=seq_lens,
             )
         return wrapper
 
@@ -196,12 +202,12 @@ class MiniMaxM3IndexerNvfp4MetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
             query_len = int(query_lens_cpu[0])
             assert torch.all((query_lens_cpu == query_len) | (query_lens_cpu == 0))
             num_pages = min(block_table.shape[1], MAX_PAGES)
-            wrapper = self._decode_wrapper(num_decodes, query_len, num_pages)
-            wrapper.plan(
-                block_table[:num_decodes, :num_pages].contiguous(),
-                seq_lens[:num_decodes],
-                query_len=query_len,
+            decode_block_table = block_table[:num_decodes, :num_pages]
+            decode_seq_lens = seq_lens[:num_decodes]
+            wrapper = self._decode_wrapper(
+                decode_block_table, decode_seq_lens, query_len
             )
+            wrapper.plan(decode_block_table, decode_seq_lens, query_len=query_len)
             decode = MiniMaxM3IndexerNvfp4DecodeMetadata(
                 wrapper=wrapper,
                 num_reqs=num_decodes,
