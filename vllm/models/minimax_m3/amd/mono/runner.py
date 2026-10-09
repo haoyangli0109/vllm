@@ -90,6 +90,17 @@ def dense_prefix(layers) -> int:
     return n
 
 
+def _fused_shared_weight() -> float:
+    """The fused shared expert's slot weight, from aiter's routing metadata."""
+    meta = rocm_aiter_moe.aiter_topK_meta_data
+    if meta is None:
+        raise MonoUnsupported("fused shared expert routing metadata")
+    total_w, total_ids = meta
+    if int(total_ids[0, TOP_K].item()) != N_ROUTED:
+        raise MonoUnsupported("fused shared expert id")
+    return float(total_w[0, TOP_K].item())
+
+
 class MonoDecodeRunner:
     """Owns the per-layer weight views, scratch, peer buffers and compiled kernels."""
 
@@ -107,13 +118,12 @@ class MonoDecodeRunner:
         ]
         attn0 = layers[n_dense].self_attn
         moe0 = layers[n_dense].block_sparse_moe
-        meta = rocm_aiter_moe.aiter_topK_meta_data
-        if meta is None:
-            raise MonoUnsupported("fused shared expert routing metadata")
-        total_w, total_ids = meta
-        if int(total_ids[0, TOP_K].item()) != N_ROUTED:
-            raise MonoUnsupported("fused shared expert id")
-        shared_weight = float(total_w[0, TOP_K].item())
+        self.shared_fp8 = self.sparse[0].shared_fp8
+        if any(lw.shared_fp8 != self.shared_fp8 for lw in self.sparse):
+            raise MonoUnsupported("shared expert fused in some layers only")
+        # a separate MXFP8 shared expert adds unscaled: routed_scaling_factor goes
+        # on the routed weights alone (route_scale), as the model's runner does
+        shared_weight = 1.0 if self.shared_fp8 else _fused_shared_weight()
         self.sm_scale = attn0.scaling
         if abs(self.sm_scale - HEAD_DIM**-0.5) > 1e-12:
             raise MonoUnsupported(f"softmax scale {self.sm_scale}")
@@ -214,6 +224,7 @@ class MonoDecodeRunner:
             _ptr(self.h), _ptr(self.q), _ptr(block_table), _ptr(seq_lens), _ptr(k16), _ptr(v16),
             _ptr(self.kv_scale), _ptr(self.kv_scale), _ptr(lw.w_o), _ptr(lw.s_o), _ptr(lw.g_post),
             _ptr(lw.gate), _ptr(lw.bias), _ptr(lw.w13), _ptr(lw.s13), _ptr(lw.w2), _ptr(lw.s2),
+            _ptr(lw.sh_args) if lw.shared_fp8 else 0,
             _ptr(self.h_mids[(i + 1) % 2]), _ptr(self.ars[(i + 1) % 2]), _ptr(self.scratch4),
             self.peers.local, _ptr(self.peers.addresses), _ptr(self.step), self.rank, lw.layer_id,
             block_table.shape[1], q_len,
@@ -256,6 +267,7 @@ class MonoDecodeRunner:
                 fuse_k1=True,
                 timeline=self.timeline is not None,
                 heads=heads,
+                shared_fp8=self.shared_fp8,
             )
             for s in range(1, MAX_TOKENS + 1)
         }

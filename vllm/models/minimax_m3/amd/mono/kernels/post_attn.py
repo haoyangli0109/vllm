@@ -159,8 +159,15 @@ W13_BYTES = W13_ROWS * HIDDEN // 2  # one expert, fp4
 W2_BYTES = HIDDEN * INTER // 2
 W13_SCALE_COLS = HIDDEN // 32
 W2_SCALE_COLS = INTER // 32
-S2_BYTES = (N_ROUTED + 1) * HIDDEN * W2_SCALE_COLS  # e8m0, every expert
-S13_BYTES = (N_ROUTED + 1) * W13_ROWS * W13_SCALE_COLS
+# the separate MXFP8 shared expert (weights.mxfp8_a_tiles): 16-row x 128-k tiles,
+# its four tables reached through the ``sh_args`` pointer table (SH_ARGS order)
+F8_TILE = 16 * 128
+SH8_W13_BYTES = W13_ROWS * HIDDEN
+SH8_W2_BYTES = HIDDEN * INTER
+SH8_S13_BYTES = W13_ROWS * W13_SCALE_COLS
+SH8_S2_BYTES = HIDDEN * W2_SCALE_COLS
+SH_ARGS = ("sh_w13", "sh_s13", "sh_w2", "sh_s2")
+SH_W13, SH_S13, SH_W2, SH_S2 = range(len(SH_ARGS))
 
 # The launch goes on the caller's current stream (graph capture included).
 _CURRENT_STREAM = fx.Stream(None)
@@ -212,14 +219,22 @@ def build_post_attn_kernel(
     timeline: bool = False,
     fuse_k1: bool = False,
     heads: IndexHeads = ONE_INDEX_HEAD,
+    shared_fp8: bool = False,
 ):
     """``@flyc.jit`` launcher of K4 for one rank of an ``npes``-way TP group and a
     decode step of ``tokens`` (<= MAX_TOKENS) rows, ``q_len`` consecutive rows a
     request (a speculative verify's), with contexts up to MAX_CONTEXT.
     ``fuse_k1``: the layer's K1 runs first in the same launch (``K1_ARGS``,
     ``positions``, ``slot_mapping``, ``res``; 0 otherwise), for a fused projection
-    of index q ``heads`` (``IndexHeads``)."""
+    of index q ``heads`` (``IndexHeads``). ``shared_fp8``: the expert tables hold
+    the routed experts only and the shared expert is MXFP8, its tables behind
+    the ``sh_args`` pointer table (``SH_ARGS``; 0 otherwise), its GEMVs fp8 x fp8
+    MFMAs."""
     assert 1 <= tokens <= MAX_TOKENS
+    N_E = N_ROUTED if shared_fp8 else N_ROUTED + 1  # experts in w13 .. s2
+    E_TOP = N_E - 1  # the bound a routed expert id is clamped to
+    S13_BYTES = N_E * W13_ROWS * W13_SCALE_COLS  # e8m0, every expert
+    S2_BYTES = N_E * HIDDEN * W2_SCALE_COLS
     W = npes
     G = BLOCKS
     BASE = stage_bases(tokens)
@@ -271,6 +286,7 @@ def build_post_attn_kernel(
         tl=timeline,
         kps=mono_config.KV_PAGE_STRIDE,
         sks=mono_config.STATIC_KV_SCALE,
+        sf8=shared_fp8,
     )
 
     # the JIT cache key holds the kernel's scalar closure values, not objects: the
@@ -303,6 +319,7 @@ def build_post_attn_kernel(
         s13: Int64,
         w2: Int64,
         s2: Int64,
+        sh_args: Int64,
         h_mid: Int64,
         ar_out: Int64,
         scratch: Int64,
@@ -1477,6 +1494,60 @@ def build_post_attn_kernel(
                 )
             )
 
+        def mfma_f8f8(w8, sa, b8, sb, c, sa_byte=None):
+            """``mfma_f4f8`` with an fp8 A: this lane's 32 fp8 of row l % 16 in the B
+            operand's k order (``f8_tile_load``); the scales are placed alike."""
+            if const_expr(sa_byte is None):
+                sa, sa_byte = sa & 0xFF, 0
+            return fx.Vector(
+                rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                    T.vec(4, T.f32), [w8, b8, c, 0, 0, sa_byte, sa, 0, sb]
+                )
+            )
+
+        def f8_tile_load(r_w, tile, slot):
+            """Lane ``slot``'s 32 fp8 of 16 x 128 tile ``tile`` (weights.mxfp8_a_tiles)
+            as the f8f6f4 MFMA's 8-dword A operand."""
+            word = (tile * F8_TILE + slot * 32) // 4
+            h = [
+                fx.Vector(
+                    bo.buffer_load(r_w, word + 4 * j, vec_width=4, dtype=T.i32)
+                )
+                for j in range(2)
+            ]
+            return fx.Vector.from_elements(
+                [h[j][e] for j in range(2) for e in range(4)], fx.Int32
+            )
+
+        def sh_ptr(i):
+            """The MXFP8 shared expert's table ``SH_ARGS[i]``, read at use from the
+            ``sh_args`` pointer table (as K1's are): as four more kernel arguments
+            they widened the kernarg pointer tuple, which ROCm LLVM's partial-
+            register rewrite spilled incompletely (a fault at S = 2)."""
+            v = fx.Vector(
+                bo.buffer_load(rsrc(sh_args), 2 * i, vec_width=2, dtype=T.i32)
+            )
+            return (fx.Int64(uniform(v[1])) << 32) | fx.Int64(
+                fx.Uint32(uniform(v[0]))
+            )
+
+        def w_tile(r_w, rg, kc, slot, k, fp8):
+            """Lane ``slot``'s A operand of row group rg, 128-k chunk kc of a table
+            of k columns: fp4 (two 16 x 64 tiles of 512 B, shuffle_weight(16, 16))
+            or MXFP8 (``f8_tile_load``)."""
+            if const_expr(fp8):
+                return f8_tile_load(r_w, rg * (k // 128) + kc, slot)
+            return fx.Vector(
+                bo.buffer_load(
+                    r_w,
+                    ((rg * (k // 64) + kc * 2) * 512 + slot * 16) // 4,
+                    vec_width=4,
+                    dtype=T.i32,
+                )
+            )
+
+        mfma_sh = mfma_f8f8 if shared_fp8 else mfma_f4f8  # the shared expert's
+
         # ============================================================ 4. router
         def stage_router():
             r_g = rsrc(g_post)
@@ -1694,9 +1765,11 @@ def build_post_attn_kernel(
             """Up / gate weights and scales of task t."""
             shared, tk, slot, cg = ug_task(t)
             # the bound keeps a corrupt route from addressing past the expert table
+            # (a shared task never gets here: ug_task_id clamps to the routed tasks
+            # and sh_load runs the shared expert)
             e_u = shared.select(
-                fx.Int32(SHARED_EXPERT),
-                fx.min(uniform(fx.ptr_load(route + (8 * tk + slot))), SHARED_EXPERT),
+                fx.Int32(min(SHARED_EXPERT, E_TOP)),
+                fx.min(uniform(fx.ptr_load(route + (8 * tk + slot))), E_TOP),
             )
             r_w = rsrc(w13 + fx.Int64(e_u) * W13_BYTES)
             r_s = rsrc(s13)
@@ -1776,34 +1849,27 @@ def build_post_attn_kernel(
             the up rows alike on the rest -- one MFMA tile; the waves split k."""
             row = (l16 < 8).select(SH_ROWS * j + l16, INTER + SH_ROWS * j + l16 - 8)
             rg = row // 16
+            if const_expr(shared_fp8):
+                w_base, s_base = sh_ptr(SH_W13), sh_ptr(SH_S13)
+                w_bytes, s_bytes, e_rows = SH8_W13_BYTES, SH8_S13_BYTES, 0
+            else:
+                w_base, s_base = w13 + fx.Int64(SHARED_EXPERT) * W13_BYTES, s13
+                w_bytes, s_bytes = W13_BYTES, S13_BYTES
+                e_rows = SHARED_EXPERT * W13_ROWS
             if const_expr(has is None):
-                r_w = rsrc(w13 + fx.Int64(SHARED_EXPERT) * W13_BYTES)
-                r_s = rsrc(s13)
+                r_w = rsrc(w_base)
+                r_s = rsrc(s_base)
             else:  # a CTA without the task reads through zero-sized buffers
-                r_w = rsrc(
-                    w13 + fx.Int64(SHARED_EXPERT) * W13_BYTES,
-                    has.select(fx.Int32(W13_BYTES), fx.Int32(0)),
-                )
-                r_s = rsrc(s13, has.select(fx.Int32(S13_BYTES), fx.Int32(0)))
+                r_w = rsrc(w_base, has.select(fx.Int32(w_bytes), fx.Int32(0)))
+                r_s = rsrc(s_base, has.select(fx.Int32(s_bytes), fx.Int32(0)))
             wts = []
             scs = []
             # the row's part of scale_index, once: a chunk adds 256 (kc / 2) + 2 (kc % 2)
-            sc_row = scale_index(SHARED_EXPERT * W13_ROWS + row, g4, W13_SCALE_COLS)
+            sc_row = scale_index(e_rows + row, g4, W13_SCALE_COLS)
             for i in range_constexpr(UG_CPW):
                 kc = wave * UG_CPW + i
                 wts.append(
-                    fx.Vector(
-                        bo.buffer_load(
-                            r_w,
-                            (
-                                (rg * (HIDDEN // 64) + kc * 2) * 512
-                                + (g4 * 16 + row % 16) * 16
-                            )
-                            // 4,
-                            vec_width=4,
-                            dtype=T.i32,
-                        )
-                    )
+                    w_tile(r_w, rg, kc, g4 * 16 + row % 16, HIDDEN, shared_fp8)
                 )
                 scs.append(e8m0_load(r_s, sc_row + kc // 2 * 256 + kc % 2 * 2))
             return wts, scs
@@ -1819,7 +1885,7 @@ def build_post_attn_kernel(
             ]
             for i in range_constexpr(UG_CPW):
                 kc = wave * UG_CPW + i
-                c = mfma_f4f8(
+                c = mfma_sh(
                     wts[i], scs[i], lds_b8(col * XN8_ROW + kc * 32), sbs[i], c
                 )
             fx.ptr_store(c, red + (wave * 64 + lane) * 4)
@@ -1857,7 +1923,7 @@ def build_post_attn_kernel(
                 jj = fx.min(j, DN_UNITS - 1)
                 sl = jj // DN_KC
                 kc = jj % DN_KC
-                e_d = fx.min(uniform(fx.ptr_load(route + (8 * k + sl))), SHARED_EXPERT)
+                e_d = fx.min(uniform(fx.ptr_load(route + (8 * k + sl))), E_TOP)
                 wv = fx.Vector(
                     bo.buffer_load(
                         rsrc(w2 + fx.Int64(e_d) * W2_BYTES, dn_bytes),
@@ -1878,25 +1944,25 @@ def build_post_attn_kernel(
 
         def down_load_shared(td, has_dn):
             """The shared expert's down units of row group td (every token's)."""
-            dn_bytes = has_dn.select(fx.Int32(W2_BYTES), fx.Int32(0))
-            dn_scale_bytes = has_dn.select(fx.Int32(S2_BYTES), fx.Int32(0))
             rg_d = td * 2 + wave // 4
+            if const_expr(shared_fp8):
+                w_base, s_base, w_bytes, s_bytes = (
+                    sh_ptr(SH_W2), sh_ptr(SH_S2), SH8_W2_BYTES, SH8_S2_BYTES,
+                )  # fmt: skip
+                e = 0
+            else:
+                w_base, s_base, w_bytes, s_bytes = (
+                    w2 + fx.Int64(SHARED_EXPERT) * W2_BYTES, s2, W2_BYTES, S2_BYTES,
+                )  # fmt: skip
+                e = SHARED_EXPERT
+            r_w = rsrc(w_base, has_dn.select(fx.Int32(w_bytes), fx.Int32(0)))
+            r_s = rsrc(s_base, has_dn.select(fx.Int32(s_bytes), fx.Int32(0)))
             units = []
             for i in range_constexpr(SH_UPW):
                 j = (wave % 4) + 4 * i
                 kc = fx.min(j, DN_KC - 1)
-                wv = fx.Vector(
-                    bo.buffer_load(
-                        rsrc(w2 + fx.Int64(SHARED_EXPERT) * W2_BYTES, dn_bytes),
-                        ((rg_d * (INTER // 64) + kc * 2) * 512 + lane * 16) // 4,
-                        vec_width=4,
-                        dtype=T.i32,
-                    )
-                )
-                sc = e8m0_load(
-                    rsrc(s2, dn_scale_bytes),
-                    group_scale_byte(SHARED_EXPERT, HIDDEN, rg_d, kc, W2_SCALE_COLS),
-                )
+                wv = w_tile(r_w, rg_d, kc, lane, INTER, shared_fp8)
+                sc = e8m0_load(r_s, group_scale_byte(e, HIDDEN, rg_d, kc, W2_SCALE_COLS))
                 wgt = (j < DN_KC).select(fx.Float32(shared_weight), fx.Float32(0.0))
                 units.append((wv, sc, kc, wgt))
             return units
@@ -1984,7 +2050,20 @@ def build_post_attn_kernel(
         # up / gate tasks go in pairs, a CTA runs both: an MXFP8 block is 32 rows
         UG_PAIRS = UG_PER_SLOT // 2
         UGW_ITERS = 2 * ((U_MAX * UG_PAIRS + G - 1) // G)  # up / gate tasks a CTA runs
-        DN_WITERS = (U_MAX * DN_KC + 3) // 4  # (expert, chunk) units a wave runs
+        # distinct experts the expert-table loops run (shared_fp8: the shared
+        # expert's MXFP8 tasks / units follow them, compiled apart)
+        U_TBL = U_MAX - 1 if shared_fp8 else U_MAX
+        # an MXFP8 shared task runs as SH_PARTS k parts, a part's weights in flight
+        # as many as a table task's: the whole task's and the next's were 192 VGPRs
+        # (256 with spills, and the table's tasks ran slower too)
+        SH_PARTS = 2
+        assert UG_CPW % SH_PARTS == 0
+
+        def sh_ks(part):
+            n = UG_CPW // SH_PARTS
+            return tuple(range(part * n, (part + 1) * n))
+
+        DN_WITERS = (U_TBL * DN_KC + 3) // 4  # (expert, chunk) units a wave runs
         DN_DEPTH = 12  # units whose weights are in flight
         ROUTE_ITERS = (tokens + WAVES - 1) // WAVES  # tokens a wave routes
 
@@ -2028,18 +2107,32 @@ def build_post_attn_kernel(
                     fx.ptr_store(fx.Int32((1 << tokens) - 1), umask + nu_)
             gpu.barrier()
 
-        def wug_load(t, has, scales=True):
-            """Up / gate weights (and ``scales``: the scale dwords, which hold the
-            pair's both halves) of task t = (distinct expert t / 48, row group
-            t % 48); without the task, reads go through zero-sized buffers."""
+        UG_KS = tuple(range(UG_CPW))
+
+        def wug_load(t, has, scales=True, fp8=False, ks=UG_KS):
+            """Up / gate weights (this wave's 128-k chunks ``ks``; and ``scales``:
+            the scale dwords, which hold the pair's both halves) of task t =
+            (distinct expert t / UG_PER_SLOT, row group t % UG_PER_SLOT); without
+            the task, reads go through zero-sized buffers. ``fp8``: the MXFP8
+            shared expert's task (weights.mxfp8_a_tiles; the scales -- every
+            chunk's -- in the routed tables' order)."""
             u = t // UG_PER_SLOT
             cg = t % UG_PER_SLOT
-            e_u = fx.min(uniform(fx.ptr_load(uexp + u)), SHARED_EXPERT)
-            r_w = rsrc(
-                w13 + fx.Int64(e_u) * W13_BYTES,
-                has.select(fx.Int32(W13_BYTES), fx.Int32(0)),
-            )
-            r_s = rsrc(s13, has.select(fx.Int32(S13_BYTES), fx.Int32(0)))
+            if const_expr(fp8):
+                e_u = 0
+                r_w = rsrc(
+                    sh_ptr(SH_W13), has.select(fx.Int32(SH8_W13_BYTES), fx.Int32(0))
+                )
+                r_s = rsrc(
+                    sh_ptr(SH_S13), has.select(fx.Int32(SH8_S13_BYTES), fx.Int32(0))
+                )
+            else:
+                e_u = fx.min(uniform(fx.ptr_load(uexp + u)), E_TOP)
+                r_w = rsrc(
+                    w13 + fx.Int64(e_u) * W13_BYTES,
+                    has.select(fx.Int32(W13_BYTES), fx.Int32(0)),
+                )
+                r_s = rsrc(s13, has.select(fx.Int32(S13_BYTES), fx.Int32(0)))
             wts = []
             scs = []
             for gu in range_constexpr(2):
@@ -2048,16 +2141,8 @@ def build_post_attn_kernel(
                 scs.append([])
                 for i in range_constexpr(UG_CPW):
                     kc = wave * UG_CPW + i
-                    wts[gu].append(
-                        fx.Vector(
-                            bo.buffer_load(
-                                r_w,
-                                ((rg * (HIDDEN // 64) + kc * 2) * 512 + lane * 16) // 4,
-                                vec_width=4,
-                                dtype=T.i32,
-                            )
-                        )
-                    )
+                    if const_expr(i in ks):
+                        wts[gu].append(w_tile(r_w, rg, kc, lane, HIDDEN, fp8))
                     if const_expr(scales and i % 2 == 0):
                         # the dword holding this lane's scales of chunks kc, kc + 1
                         # of both 16-row halves of the 32-row block (bytes 2 d + a)
@@ -2076,23 +2161,35 @@ def build_post_attn_kernel(
                         )
             return wts, scs
 
-        def wug_y(wts, scs, half):
-            """A task's up / gate GEMV for every token (B column l % 16 = token
-            l % 16) -> swiglu: thread (row r, token k)'s mid value. ``half``: the
-            task's 16-row half of its 32-row scale block (compile time)."""
+        def wug_acc(wts, scs, half, cg_, cu_, ks=UG_KS, fp8=False):
+            """A task's up / gate MFMAs over its 128-k chunks ``ks`` of this wave
+            (wts[gu][j]: chunk ks[j]) for every token (B column l % 16 = token
+            l % 16), into (cg_, cu_). ``half``: the task's 16-row half of its
+            32-row scale block (compile time); ``fp8``: an MXFP8 task
+            (``wug_load(fp8=True)``)."""
+            mfma_ = mfma_f8f8 if fp8 else mfma_f4f8
             col = fx.min(l16, tokens - 1)
-            cg_ = fx.Vector.filled(4, 0.0, fx.Float32)
-            cu_ = fx.Vector.filled(4, 0.0, fx.Float32)
             sbs = [
                 lds_i32(XSC_LDS + col * XSC_ROW + (wave * UG_CPW + i) * 4 + g4)
-                for i in range(UG_CPW)
+                for i in ks
             ]
-            for i in range_constexpr(UG_CPW):
+            for j in range_constexpr(len(ks)):
+                i = ks[j]
                 kc = wave * UG_CPW + i
                 xb = lds_b8(col * XN8_ROW + kc * 32)
                 sel = (i % 2) * 2 + half
-                cg_ = mfma_f4f8(wts[0][i], scs[0][i // 2], xb, sbs[i], cg_, sel)
-                cu_ = mfma_f4f8(wts[1][i], scs[1][i // 2], xb, sbs[i], cu_, sel)
+                cg_ = mfma_(wts[0][j], scs[0][i // 2], xb, sbs[j], cg_, sel)
+                cu_ = mfma_(wts[1][j], scs[1][i // 2], xb, sbs[j], cu_, sel)
+            return cg_, cu_
+
+        def wug_y(wts, scs, half):
+            """A task's up / gate GEMV (``wug_acc``) -> swiglu: thread (row r,
+            token k)'s mid value."""
+            zero = fx.Vector.filled(4, 0.0, fx.Float32)
+            return wug_swiglu(*wug_acc(wts, scs, half, zero, zero))
+
+        def wug_swiglu(cg_, cu_):
+            """The waves' up / gate partials -> swiglu (``wug_y``)."""
             fx.ptr_store(cg_, red + (wave * 64 + lane) * 4)
             fx.ptr_store(cu_, fpool + (W_UPP + (wave * 64 + lane) * 4))
             gpu.barrier()
@@ -2229,15 +2326,49 @@ def build_post_attn_kernel(
                     sk * 2 * MOE_SLOTS + MOE_SLOTS + sj,
                     fx.ptr_load(rwt + (8 * sk + sj)),
                 )
-            n_pairs = (uniform(fx.ptr_load(uexp + (U_MAX + 1))) + 1) * UG_PAIRS
+            nu_ug = uniform(fx.ptr_load(uexp + (U_MAX + 1)))
+            n_pairs = (nu_ug if shared_fp8 else nu_ug + 1) * UG_PAIRS
+            # shared_fp8: shared pair j runs after the table's pairs on CTA
+            # (sh0 + j) % G. It costs two of theirs: from a full round of pairs on,
+            # the table's skip slots hole0 .. hole0 + UG_PAIRS - 1 (slot s: CTA s %
+            # G's (s / G)-th pair), the shared CTAs' last full round, so that those
+            # carry one pair fewer (otherwise the up / gate stage ran a pair longer
+            # than the fused build's at every S; S = 8: 25.8 -> 31.6 us slowest CTA)
+            sh0 = n_pairs
+            if const_expr(shared_fp8):
+                hole0 = n_pairs + (UG_PAIRS - G)
+                holes = hole0 >= 0
+                sh0 = n_pairs + holes.select(fx.Int32(UG_PAIRS), fx.Int32(0))
+            sh_j = (bid + (G - sh0 % G)) % G
+            has_shp = sh_j < UG_PAIRS
+            sh_pr = n_pairs + fx.min(sh_j, UG_PAIRS - 1)
+            UG_ALL = UGW_ITERS + (2 * SH_PARTS if shared_fp8 else 0)
 
             def task(it):
-                """Iteration it's task: pair bid + (it / 2) G's half it % 2."""
+                """Iteration it's task: slot bid + (it / 2) G's pair, half it % 2
+                (past UGW_ITERS: the shared pair's, half (it - UGW_ITERS) / SH_PARTS
+                a k part an iteration)."""
+                if const_expr(it >= UGW_ITERS):
+                    return sh_pr * 2 + (it - UGW_ITERS) // SH_PARTS, has_shp
                 pr = fx.Int32(bid + it // 2 * G)
+                if const_expr(shared_fp8):
+                    # a hole runs nothing (pair n_pairs); past them, UG_PAIRS lower
+                    pr = (holes & (pr >= hole0)).select(
+                        (pr < hole0 + UG_PAIRS).select(n_pairs, pr - UG_PAIRS), pr
+                    )
                 return fx.min(pr, n_pairs - 1) * 2 + it % 2, pr < n_pairs
 
+            def task_load(it, t, has, scales=True):
+                if const_expr(it >= UGW_ITERS):
+                    # the shared pair's scales come with its first part
+                    q = it - UGW_ITERS
+                    return wug_load(
+                        t, has, scales=q == 0, fp8=True, ks=sh_ks(q % SH_PARTS)
+                    )
+                return wug_load(t, has, scales)
+
             t0, h0 = task(0)
-            cur = wug_load(t0, h0)  # task 0: a lo half, with the pair's scales
+            cur = task_load(0, t0, h0)  # task 0: a lo half, with the pair's scales
             down_tables()
             stamp(7)
             # the first task's weights are in flight: now the xn
@@ -2275,21 +2406,44 @@ def build_post_attn_kernel(
                         )
             gpu.barrier()
             y_lo = fx.Float32(0.0)  # the pair's first half, until the second's
-            for it in range_constexpr(UGW_ITERS):
+            if const_expr(shared_fp8):
+                # a shared half's up / gate accumulators, part to part
+                sh_cg = fx.Vector.filled(4, 0.0, fx.Float32)
+                sh_cu = fx.Vector.filled(4, 0.0, fx.Float32)
+            for it in range_constexpr(UG_ALL):
                 t, has_t = task(it)
-                if const_expr(it + 1 < UGW_ITERS):
+                if const_expr(it + 1 < UG_ALL):
                     tn, hn = task(it + 1)
                     # a hi half reads no scales: its lo half's dwords hold them
-                    nxt = wug_load(tn, hn, scales=(it + 1) % 2 == 0)
-                if const_expr(it % 2 == 0):
-                    pair_scs = cur[1]
-                if has_t:
-                    y = wug_y(cur[0], pair_scs, it % 2)  # a pair: row groups cg, cg + 1
+                    nxt = task_load(it + 1, tn, hn, scales=(it + 1) % 2 == 0)
+                if const_expr(it < UGW_ITERS):
                     if const_expr(it % 2 == 0):
-                        y_lo = y
-                    else:
-                        wug_publish(t // 2, y_lo, y)
-                if const_expr(it + 1 < UGW_ITERS):
+                        pair_scs = cur[1]
+                    if has_t:
+                        # a pair: row groups cg, cg + 1
+                        y = wug_y(cur[0], pair_scs, it % 2)
+                        if const_expr(it % 2 == 0):
+                            y_lo = y
+                        else:
+                            wug_publish(t // 2, y_lo, y)
+                else:
+                    half, part = divmod(it - UGW_ITERS, SH_PARTS)
+                    if const_expr(half == 0 and part == 0):
+                        pair_scs = cur[1]
+                    if has_t:
+                        if const_expr(part == 0):
+                            sh_cg = fx.Vector.filled(4, 0.0, fx.Float32)
+                            sh_cu = fx.Vector.filled(4, 0.0, fx.Float32)
+                        sh_cg, sh_cu = wug_acc(
+                            cur[0], pair_scs, half, sh_cg, sh_cu, sh_ks(part), fp8=True
+                        )
+                        if const_expr(part == SH_PARTS - 1):
+                            y = wug_swiglu(sh_cg, sh_cu)
+                            if const_expr(half == 0):
+                                y_lo = y
+                            else:
+                                wug_publish(t // 2, y_lo, y)
+                if const_expr(it + 1 < UG_ALL):
                     cur = nxt
             stamp(8)
             if has_dn:
@@ -2302,7 +2456,7 @@ def build_post_attn_kernel(
             there), route-weighted per column -> ffn_finish."""
             nu = uniform(fx.ptr_load(uexp + (U_MAX + 1)))
             rg_d = td * 2 + wave // 4
-            n_units = (nu + 1) * DN_KC
+            n_units = (nu if shared_fp8 else nu + 1) * DN_KC
 
             def unit_load(i):
                 """(weights, scale, unit) of this wave's i-th (expert, 128-k chunk)
@@ -2313,7 +2467,7 @@ def build_post_attn_kernel(
                 # row, never past urow (a garbage row is garbage B, and 0 * NaN)
                 du = fx.min(j // DN_KC, U_MAX - 1)
                 dkc = j % DN_KC
-                de = fx.min(uniform(fx.ptr_load(uexp + du)), SHARED_EXPERT)
+                de = fx.min(uniform(fx.ptr_load(uexp + du)), E_TOP)
                 dwv = fx.Vector(
                     bo.buffer_load(
                         rsrc(
@@ -2342,6 +2496,25 @@ def build_post_attn_kernel(
             # software pipeline: the first units' weights go out before the mids are
             # in; unit i + DN_DEPTH's before unit i's MFMA
             acc = [fx.Float32(0.0) for _ in range(4)]
+            if const_expr(shared_fp8):
+                # the MXFP8 shared expert's units (wave % 4 + 4 i): no routing needed,
+                # their weights go out first
+                r_shw = rsrc(sh_ptr(SH_W2))
+                r_shs = rsrc(sh_ptr(SH_S2))
+                sh_dn = []
+                for i in range_constexpr(SH_UPW):
+                    skc = fx.min(wave % 4 + 4 * i, DN_KC - 1)
+                    sh_dn.append(
+                        (
+                            f8_tile_load(r_shw, rg_d * (INTER // 128) + skc, lane),
+                            e8m0_load(
+                                r_shs,
+                                group_scale_byte(0, HIDDEN, rg_d, skc, W2_SCALE_COLS),
+                            ),
+                            skc,
+                            wave % 4 + 4 * i < DN_KC,
+                        )
+                    )
             inflight = [unit_load(i) for i in range(min(DN_DEPTH, DN_WITERS))]
             # every up / gate task pair's flag, then the MXFP8 mid rows and their
             # scales, the pool's layout (plain words, 16 B a load)
@@ -2397,6 +2570,22 @@ def build_post_attn_kernel(
                 acc = [
                     acc[e] + ok.select(dcu[e] * dw, fx.Float32(0.0)) for e in range(4)
                 ]
+            if const_expr(shared_fp8):
+                # the shared expert's B column l16: its mid row (slot TOP_K) and weight
+                srow = fx.Int32(fx.ptr_load(urow + (nu * 16 + l16)))
+                sw = fx.ptr_load(uwt + (nu * 16 + l16))
+                for swv, ssc, skc, sok in sh_dn:
+                    dcu = mfma_f8f8(
+                        swv,
+                        ssc,
+                        lds_b8(srow * MID_ROW + skc * 32),
+                        lds_i32(W_MIDSC + srow * MIDSC_ROW + skc * 4 + g4),
+                        fx.Vector.filled(4, 0.0, fx.Float32),
+                    )
+                    acc = [
+                        acc[e] + sok.select(dcu[e] * sw, fx.Float32(0.0))
+                        for e in range(4)
+                    ]
             a0, a1, a2, a3 = acc
             fx.ptr_store(
                 fx.Vector.from_elements([a0, a1, a2, a3], fx.Float32),
@@ -2600,7 +2789,7 @@ def build_post_attn_kernel(
             col_tok = fx.min(l16, tokens - 1)
             sh = [fx.Float32(0.0) for _ in range(4)]
             for wv, sc, kc, wgt in sh_units:
-                cu = mfma_f4f8(
+                cu = mfma_sh(
                     wv,
                     sc,
                     lds_b8(
@@ -2692,6 +2881,7 @@ def build_post_attn_kernel(
         s13: Int64,
         w2: Int64,
         s2: Int64,
+        sh_args: Int64,
         h_mid: Int64,
         ar_out: Int64,
         scratch: Int64,
@@ -2727,6 +2917,7 @@ def build_post_attn_kernel(
             s13,
             w2,
             s2,
+            sh_args,
             h_mid,
             ar_out,
             scratch,

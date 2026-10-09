@@ -41,6 +41,17 @@ def _dense_prefix_ok(layers) -> bool:
     return True
 
 
+def _separate_shared_ok(layers) -> bool:
+    """Every MoE layer keeps its shared expert as a separate MLP (the kernels then
+    run it from that MLP's MXFP8 weights, ``weights.mxfp8_a_tiles``)."""
+    moes = [lyr.block_sparse_moe for lyr in layers if lyr.is_moe_layer]
+    return bool(moes) and all(
+        not m.is_fused_shared_expert_enabled
+        and getattr(m, "shared_experts", None) is not None
+        for m in moes
+    )
+
+
 def _config_refusal(vllm_config: VllmConfig, model) -> str | None:
     """Why this deployment cannot use the kernels at all, or None."""
     pc = vllm_config.parallel_config
@@ -59,8 +70,9 @@ def _config_refusal(vllm_config: VllmConfig, model) -> str | None:
         (max_len <= MAX_CONTEXT, f"max_model_len {max_len} > {MAX_CONTEXT}"),
         (cg is None or not cg.requires_piecewise_compilation(), "piecewise cudagraph"),
         (
-            getattr(model, "is_fused_shared_expert_enabled", False),
-            "fused shared experts off",
+            getattr(model, "is_fused_shared_expert_enabled", False)
+            or _separate_shared_ok(model.layers),
+            "shared expert neither fused nor a separate MLP",
         ),
         (_dense_prefix_ok(model.layers), "layer mix"),
         (not getattr(model, "aux_hidden_state_layers", ()), "Eagle3 aux layers"),
@@ -149,7 +161,12 @@ class MonoDecode:
             logger.exception("MiniMax-M3 mono decode: runner build failed")
             self._enabled = False
             return False
-        logger.info("MiniMax-M3 mono decode on")
+        if self._runner.shared_fp8:
+            copy = sum(lw.shared_bytes() for lw in self._runner.sparse)
+            how = f"separate MXFP8 ({copy / 2**30:.2f} GiB tiled copy per rank)"
+        else:
+            how = "fused into the MXFP4 expert tables"
+        logger.info("MiniMax-M3 mono decode on: shared expert %s", how)
         return True
 
     def _slots_shared(self, fwd: ForwardContext, n: int) -> bool:

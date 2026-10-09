@@ -100,16 +100,22 @@ def _vllm_config(**overrides):
     return cfg
 
 
-def _model(fse: bool = True, aux=()):
+def _model(fse: bool = True, shared_mlp: bool = True, aux=()):
+    moe = _layer(True, True)
+    moe.block_sparse_moe = SimpleNamespace(
+        is_fused_shared_expert_enabled=fse,
+        shared_experts=object() if shared_mlp else None,
+    )
     return SimpleNamespace(
         is_fused_shared_expert_enabled=fse,
         aux_hidden_state_layers=aux,
-        layers=[_layer(False, True)] * 3 + [_layer(True, True)] * 2,
+        layers=[_layer(False, True)] * 3 + [moe] * 2,
     )
 
 
-def test_config_refusal_accepts_the_supported_deployment():
-    assert _config_refusal(_vllm_config(), _model()) is None
+@pytest.mark.parametrize("fse", [True, False])
+def test_config_refusal_accepts_the_supported_deployment(fse):
+    assert _config_refusal(_vllm_config(), _model(fse=fse)) is None
 
 
 @pytest.mark.parametrize(
@@ -123,7 +129,7 @@ def test_config_refusal_accepts_the_supported_deployment():
             _model(),
             "max_model_len",
         ),
-        (_vllm_config(), _model(fse=False), "fused shared experts"),
+        (_vllm_config(), _model(fse=False, shared_mlp=False), "neither fused nor"),
         (_vllm_config(), _model(aux=(2, 30)), "Eagle3"),
     ],
 )

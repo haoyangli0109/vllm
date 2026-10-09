@@ -11,6 +11,11 @@ layout assumption is asserted once and a model that does not match is refused
 128). The attention linears are MXFP8 in vLLM and the router gate is fp32, so
 those are converted once when the runner is built: MXFP8 -> bf16 -> per-channel
 fp8, preshuffled (16, 16); gate -> bf16.
+
+Without shared-expert fusion the routed table holds the 128 routed experts and
+the shared expert stays the separate MXFP8 MLP; its weights are copied once into
+the f8f6f4 MFMA's fp8 A-operand order (``mxfp8_a_tiles``, the same bytes) with
+``e8m0_shuffle``-ordered scales, so the kernels run it in MXFP8.
 """
 
 from dataclasses import dataclass
@@ -23,6 +28,7 @@ from aiter.ops.shuffle import shuffle_weight
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     dequant_mxfp8_to_bf16,
 )
+from vllm.models.minimax_m3.amd.mono.kernels.post_attn import SH_ARGS
 from vllm.models.minimax_m3.amd.mono.config import (
     MonoUnsupported,
     HEAD_DIM,
@@ -76,6 +82,23 @@ class SparseMoeLayer:
     s13: torch.Tensor
     w2: torch.Tensor
     s2: torch.Tensor
+    # the separate MXFP8 shared expert (``mxfp8_a_tiles``) and the int64 table of
+    # their addresses the kernels take (``SH_ARGS`` order); None when it is fused
+    sh_w13: torch.Tensor | None = None
+    sh_s13: torch.Tensor | None = None
+    sh_w2: torch.Tensor | None = None
+    sh_s2: torch.Tensor | None = None
+    sh_args: torch.Tensor | None = None
+
+    @property
+    def shared_fp8(self) -> bool:
+        return self.sh_args is not None
+
+    def shared_bytes(self) -> int:
+        """Bytes of the kernels' copy of the separate shared expert."""
+        if not self.shared_fp8:
+            return 0
+        return sum(t.numel() for t in (self.sh_w13, self.sh_s13, self.sh_w2, self.sh_s2))
 
 
 def _ptpc_fp8_from_mxfp8(
@@ -99,6 +122,50 @@ def _ptpc_fp8_from_mxfp8(
         shuffle_weight(q, layout=(16, 16)).contiguous(),
         scale.view(rows).to(torch.float32).contiguous(),
     )
+
+
+def mxfp8_a_tiles(
+    linear, rows: int, cols: int, name: str
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """MXFP8 linear (fp8 [rows, cols], e8m0 [rows, cols/32]) -> its bytes in the
+    f8f6f4 MFMA's fp8 A order and its scales in ``e8m0_shuffle`` order.
+
+    A 16-row x 128-k tile is 2 KiB; lane g * 16 + r of a tile holds row r's k
+    16 g .. + 16 then 64 + 16 g .. + 16 (the B operand's order), 32 bytes."""
+    w = getattr(linear, "weight", None)
+    s = getattr(linear, "weight_scale", None)
+    _need(
+        w is not None and w.dtype == dtypes.fp8 and tuple(w.shape) == (rows, cols),
+        f"{name}: weight {None if w is None else (w.dtype, tuple(w.shape))}",
+    )
+    _need(
+        s is not None and tuple(s.shape) == (rows, cols // 32),
+        f"{name}: scale {None if s is None else tuple(s.shape)}",
+    )
+    # the row-major layout the native MXFP8 linear kernel keeps; a kernel that
+    # preshuffles or pads would make the tiles silently wrong
+    _need(
+        not getattr(w, "is_shuffled", False) and not getattr(s, "is_shuffled", False),
+        f"{name}: weight preshuffled",
+    )
+    _need(rows % 32 == 0 and cols % 256 == 0, f"{name}: shape {rows} x {cols}")
+    tiles = (
+        w.data.contiguous()
+        .view(torch.uint8)
+        .view(rows // 16, 16, cols // 128, 2, 4, 16)
+        .permute(0, 2, 4, 1, 3, 5)
+        .contiguous()
+        .view(-1)
+    )
+    scales = (
+        s.data.contiguous()
+        .view(torch.uint8)
+        .view(rows // 32, 2, 16, cols // 256, 2, 4)
+        .permute(0, 3, 5, 2, 4, 1)
+        .contiguous()
+        .view(-1)
+    )
+    return tiles, scales
 
 
 def _cos_sin(attn, layer_id: int) -> torch.Tensor:
@@ -153,12 +220,29 @@ def build_sparse_layer(
     moe = layer.block_sparse_moe
     # FusedMoEFactory returns a MoERunner wrapping the RoutedExperts module
     experts = getattr(moe.experts, "routed_experts", moe.experts)
-    E = N_ROUTED + 1
+    fused = moe.is_fused_shared_expert_enabled
+    E = N_ROUTED + 1 if fused else N_ROUTED
     w13, w2 = experts.w13_weight, experts.w2_weight
     _need(
-        moe.is_fused_shared_expert_enabled and w13.shape[0] == E,
-        f"layer {layer_id}: fused shared expert (experts {w13.shape[0]})",
+        w13.shape[0] == E,
+        f"layer {layer_id}: {'fused' if fused else 'separate'} shared expert "
+        f"(experts {w13.shape[0]})",
     )
+    shared = {}
+    if not fused:
+        mlp = moe.shared_experts
+        _need(mlp is not None, f"layer {layer_id}: no shared expert")
+        shared["sh_w13"], shared["sh_s13"] = mxfp8_a_tiles(
+            mlp.gate_up_proj, 2 * INTER, HIDDEN, f"layer {layer_id} shared gate_up"
+        )
+        shared["sh_w2"], shared["sh_s2"] = mxfp8_a_tiles(
+            mlp.down_proj, HIDDEN, INTER, f"layer {layer_id} shared down"
+        )
+        shared["sh_args"] = torch.tensor(
+            [shared[a].data_ptr() for a in SH_ARGS],
+            dtype=torch.int64,
+            device=shared["sh_w13"].device,
+        )
     _need(experts.top_k == TOP_K, f"layer {layer_id}: top_k {experts.top_k}")
     _need(
         getattr(w13, "is_shuffled", False) and getattr(w2, "is_shuffled", False),
@@ -205,4 +289,5 @@ def build_sparse_layer(
         s13=s13.data,
         w2=w2.data,
         s2=s2.data,
+        **shared,
     )
