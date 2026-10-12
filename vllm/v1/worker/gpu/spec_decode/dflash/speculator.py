@@ -10,7 +10,6 @@ from vllm.config import VllmConfig, replace
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
-from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
@@ -818,7 +817,7 @@ def prepare_dflash_inputs(
         CP_SIZE=cp_size,
         CP_INTERLEAVE=cp_interleave,
         BLOCK_SIZE=BLOCK_SIZE,
-        # ROCm pads in wide blocks (BLOCK_SIZE is 8 in a decode step: 8K serial
-        # iterations up to max_num_tokens); other platforms are unchanged.
-        PAD_BLOCK=1024 if current_platform.is_rocm() else BLOCK_SIZE,
+        # Pad in wide blocks: at BLOCK_SIZE (8 in a decode step) the padding up
+        # to max_num_tokens takes thousands of serial iterations (~20 us).
+        PAD_BLOCK=1024,
     )
