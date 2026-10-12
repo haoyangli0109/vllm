@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
@@ -424,6 +424,9 @@ def test_context_kv_uses_quantized_projection_fallback(monkeypatch):
     model = SimpleNamespace(
         hidden_norm=SimpleNamespace(weight=nn.Parameter(torch.ones(2))),
         _rms_norm_eps=1e-6,
+    )
+    model._normalize_context_states = MethodType(
+        qwen3_dflash.DFlashQwen3Model._normalize_context_states, model
     )
     layers_attn = [
         SimpleNamespace(

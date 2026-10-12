@@ -1337,13 +1337,20 @@ class FlashAttentionImpl(AttentionImpl):
 
             descale_shape = (cu_seqlens_q.shape[0] - 1, self.num_kv_heads)
 
+            # A (1, 1) expanded view (one sequence, one KV head per rank) counts
+            # as contiguous, so FA4 skips its copy and its CuTe layout check then
+            # rejects the zero stride.
             q_descale = (
-                layer._q_scale.expand(descale_shape)
+                canonicalize_singleton_dim_strides(layer._q_scale.expand(descale_shape))
                 if self.supports_quant_query_input
                 else None
             )
-            k_descale = layer._k_scale.expand(descale_shape)
-            v_descale = layer._v_scale.expand(descale_shape)
+            k_descale = canonicalize_singleton_dim_strides(
+                layer._k_scale.expand(descale_shape)
+            )
+            v_descale = canonicalize_singleton_dim_strides(
+                layer._v_scale.expand(descale_shape)
+            )
 
             if self.dcp_world_size > 1:
                 self._forward_with_dcp(

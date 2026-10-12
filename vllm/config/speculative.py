@@ -1028,7 +1028,25 @@ class SpeculativeConfig:
                 text_config.num_kv_shared_layers = 0
             hf_config.update({"n_predict": 1, "architectures": ["Gemma4MTPModel"]})
 
-        if (
+        if initial_architecture == "DSparkMiniMaxDraftModel":
+            quantization_config = getattr(hf_config, "quantization_config", None)
+            hf_config = getattr(hf_config, "text_config", hf_config)
+            if (
+                quantization_config is not None
+                and getattr(hf_config, "quantization_config", None) is None
+            ):
+                hf_config.update({"quantization_config": quantization_config})
+            dflash_config = dict(getattr(hf_config, "dflash_config", None) or {})
+            dflash_config.setdefault("causal", False)
+            hf_config.model_type = "minimax_m3_dspark"
+            hf_config.update(
+                {
+                    "architectures": ["DSparkMiniMaxDraftModel"],
+                    "dflash_config": dflash_config,
+                    "markov_rank": hf_config.dspark_markov_rank,
+                }
+            )
+        elif (
             hf_config.model_type == "minimax_m3_vl"
             or initial_architecture == "MiniMaxM3SparseForConditionalGeneration"
         ):
@@ -1429,6 +1447,8 @@ class SpeculativeConfig:
                     not in self.draft_model_config.architectures
                     and "Gemma4DSparkModel" not in self.draft_model_config.architectures
                     and "K3DSparkModel" not in self.draft_model_config.architectures
+                    and "DSparkMiniMaxDraftModel"
+                    not in self.draft_model_config.architectures
                 ):
                     # DeepSeek-V4(.1) DSpark reuses the full target config
                     # and its weights ship in the target checkpoint.

@@ -314,6 +314,10 @@ class SchedulerOutput:
     # Number of spec tokens to schedule for the next step.
     num_spec_tokens_to_schedule: int = 0
 
+    # Every scheduled request has unusable drafts after this step: it is still
+    # prefilling or is guaranteed to reach max_tokens. Context KV is still needed.
+    skip_draft_proposals: bool = False
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(

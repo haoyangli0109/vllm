@@ -92,6 +92,7 @@ from vllm.models.minimax_m3.amd.indexer_aiter import (
     MiniMaxM3AiterIndexer,
     select_aiter_indexer_impl_cls,
 )
+from vllm.models.minimax_m3.amd.mono.envs import envs as mono_envs
 from vllm.models.minimax_m3.amd.ops import (
     gemma_fused_add_rmsnorm,
     gemma_rmsnorm,
@@ -102,7 +103,6 @@ from vllm.models.minimax_m3.amd.ops.sparse_pa import (
     minimax_m3_alloc_sparse_block_table,
     minimax_m3_sparse_block_page_stride,
 )
-from vllm.models.minimax_m3.amd.mono.envs import envs as mono_envs
 from vllm.models.minimax_m3.amd.sparse_attention_msa import (
     MiniMaxM3SparseAiterPADecodeMetadata,
     MiniMaxM3SparseAiterPAImpl,
@@ -1361,6 +1361,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
 
 class MiniMaxM3Model(nn.Module, EagleModelMixin):
     fall_back_to_pt_during_load = False
+    supports_aux_hidden_states_over_pp = True
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -1495,9 +1496,15 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
-        # EAGLE3 is not yet compatible with pipeline parallel
-        aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
-        for idx, layer in enumerate(self.layers[self.start_layer : self.end_layer]):
+        remote_aux = self.collect_remote_aux_hidden_states(intermediate_tensors)
+        aux_hidden_states: list[torch.Tensor] = []
+        if get_pp_group().is_first_rank:
+            self._maybe_add_hidden_state(
+                aux_hidden_states, self.start_layer, hidden_states, residual
+            )
+        for idx, layer in enumerate(
+            self.layers[self.start_layer : self.end_layer], start=self.start_layer
+        ):
             hidden_states, residual = layer(positions, hidden_states, residual)
             self._maybe_add_hidden_state(
                 aux_hidden_states, idx + 1, hidden_states, residual
@@ -1505,11 +1512,16 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
-                {"hidden_states": hidden_states, "residual": residual}
+                {
+                    "hidden_states": hidden_states,
+                    "residual": residual,
+                    **self.pack_local_aux_hidden_states(aux_hidden_states),
+                }
             )
 
         hidden_states, _ = self.norm(hidden_states, residual)
 
+        aux_hidden_states = remote_aux + aux_hidden_states
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
         return hidden_states

@@ -6,10 +6,13 @@ from typing import Any
 import numpy as np
 import torch
 
-from vllm.config import SpeculativeConfig
+from vllm import envs
+from vllm.config import SpeculativeConfig, VllmConfig
 from vllm.config.model import PROCESSED_LOGPROBS_MODES
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.v1.outputs import LogprobsTensors
+from vllm.v1.sample.ops.topk_topp_triton import _SPLIT_MAX_BATCH
 from vllm.v1.spec_decode.utils import unconditional_to_conditional_rates
 from vllm.v1.watermarking.gpu_sampler import GPUWatermarkSampler
 from vllm.v1.worker.gpu.input_batch import (
@@ -21,6 +24,7 @@ from vllm.v1.worker.gpu.sample.logprob import compute_topk_scores
 from vllm.v1.worker.gpu.sample.output import SamplerOutput, SamplingMaskTensors
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS
+from vllm.v1.worker.gpu.sample.topp_radix import compute_topp_thresholds_radix2
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
     rejection_sample,
 )
@@ -144,7 +148,25 @@ def gather_draft_sampled(
     return draft_sampled, pos
 
 
+def radix_topp_reachable(vllm_config: VllmConfig, decode_query_len: int) -> bool:
+    """Whether verification can take the radix2 top-p path, from the env and the
+    config alone so that every rank agrees (the warmup compiles it on all of them)."""
+    scheduler_config = vllm_config.scheduler_config
+    max_rows = min(
+        scheduler_config.max_num_seqs * decode_query_len,
+        scheduler_config.max_num_batched_tokens,
+    )
+    return (
+        envs.VLLM_SPEC_DECODE_RADIX_TOPP
+        and current_platform.is_cuda()
+        and vllm_config.watermark_config is None
+        and max_rows > _SPLIT_MAX_BATCH
+    )
+
+
 class RejectionSampler:
+    use_radix_topp = False
+
     def __init__(
         self,
         sampler: Sampler,
@@ -173,6 +195,30 @@ class RejectionSampler:
             )
         elif rejection_sample_method == "block":
             self.use_block_verification = True
+        # VLLM_SPEC_DECODE_RADIX_TOPP: radix2 top-p thresholds, applied on load.
+        self.use_radix_topp = (
+            envs.VLLM_SPEC_DECODE_RADIX_TOPP
+            and current_platform.is_cuda()
+            and watermark_key is None
+        )
+
+    def _use_radix_topp(self, logits: torch.Tensor, idx_mapping_np: np.ndarray) -> bool:
+        """Whether this chunk can skip apply_sampling_params: above _SPLIT_MAX_BATCH
+        rows whose requests use only temperature and top-p."""
+        if not self.use_radix_topp:
+            return False
+        if logits.dtype != torch.bfloat16 or logits.shape[0] <= _SPLIT_MAX_BATCH:
+            return False
+        sampler = self.sampler
+        if not np.any(sampler.needs_logits_processing[idx_mapping_np]):
+            return False  # raw logits go straight to the kernels already
+        if np.any(sampler.needs_other_processing[idx_mapping_np]):
+            return False
+        states = sampler.sampling_states
+        return bool(
+            np.all(states.min_p.np[idx_mapping_np] == 0.0)
+            and np.all(states.top_k.np[idx_mapping_np] == states.vocab_size)
+        )
 
     def _get_logprobs_tensors(
         self,
@@ -254,17 +300,27 @@ class RejectionSampler:
         expanded_local_pos: torch.Tensor,
         seq_lens_upper_bound_np: np.ndarray,
         verify_draft_sampled: torch.Tensor,
+        allow_radix_topp: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        processed_logits = self.sampler.apply_sampling_params(
-            logits,
-            expanded_idx_mapping,
-            idx_mapping,
-            idx_mapping_np,
-            pos,
-            draft_sampled,
-            expanded_local_pos,
-            seq_lens_upper_bound_np,
-        )
+        target_topp_thresh = None
+        if allow_radix_topp and self._use_radix_topp(logits, idx_mapping_np):
+            # The kernels apply temperature and top-p to the raw logits on load.
+            states = self.sampler.sampling_states
+            target_topp_thresh = compute_topp_thresholds_radix2(
+                logits, expanded_idx_mapping, states.temperature.gpu, states.top_p.gpu
+            )
+            processed_logits = logits
+        else:
+            processed_logits = self.sampler.apply_sampling_params(
+                logits,
+                expanded_idx_mapping,
+                idx_mapping,
+                idx_mapping_np,
+                pos,
+                draft_sampled,
+                expanded_local_pos,
+                seq_lens_upper_bound_np,
+            )
         sampled, num_sampled = rejection_sample(
             processed_logits,
             draft_logits,
@@ -283,6 +339,7 @@ class RejectionSampler:
             **self._watermarking_kwargs(
                 draft_sampled, expanded_idx_mapping, expanded_local_pos
             ),
+            target_topp_thresh=target_topp_thresh,
         )
         return processed_logits, sampled, num_sampled
 
@@ -307,6 +364,12 @@ class RejectionSampler:
         cu_num_logits_np = input_batch.cu_num_logits_np
         use_processed_logits = self.sampler.logprobs_mode in PROCESSED_LOGPROBS_MODES
         num_reqs = input_batch.num_reqs
+        # Processed logprobs and the sampling mask read the materialized
+        # processed logits.
+        allow_radix_topp = not (
+            (use_processed_logits and max_num_logprobs != NO_LOGPROBS)
+            or self.sampler.return_sampling_mask
+        )
 
         if logits.shape[0] <= max_chunk_logits:
             # One chunk covers the batch. Adaptive verification compacts the logits
@@ -348,6 +411,7 @@ class RejectionSampler:
                 input_batch.expanded_local_pos[lo:hi],
                 input_batch.seq_lens_cpu_upper_bound.numpy()[start:end],
                 verify_draft_sampled[lo:hi],
+                allow_radix_topp,
             )
             chunk_logprobs = self._get_logprobs_tensors(
                 sampled,

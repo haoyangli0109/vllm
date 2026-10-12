@@ -114,6 +114,42 @@ def test_dspark_width_is_independent_of_mtp_stages(
 
 
 @pytest.mark.cpu_test
+def test_minimax_dspark_draft_promotes_text_config():
+    """The MiniMax DSpark draft ships a VL wrapper config. It must keep its own
+    draft class (not MiniMax MTP or DeepSeek DSpark), with the DSpark keys and
+    the wrapper's quantization config on the promoted text config."""
+    quantization_config = {
+        "quant_method": "mxfp8",
+        "ignored_layers": ["language_model.model.dspark.fc"],
+    }
+    text_config = _make_hf_config(
+        architectures=["DSparkMiniMaxDraftModel"],
+        model_type="",
+        num_hidden_layers=5,
+        dspark_block_size=7,
+        dspark_markov_rank=256,
+        dflash_config={"block_size": 7},
+    )
+    hf_kwargs = dict(
+        model_type="minimax_m3_vl",
+        architectures=["DSparkMiniMaxDraftModel"],
+        quantization_config=quantization_config,
+        text_config=text_config,
+    )
+    config = _make_speculative_config(
+        hf_kwargs, "DSparkMiniMaxDraftModel", method="dspark"
+    )
+
+    hf_config = config.draft_model_config.hf_config
+    assert hf_config is text_config
+    assert hf_config.architectures == ["DSparkMiniMaxDraftModel"]
+    assert config.num_speculative_tokens == 7
+    assert hf_config.quantization_config == quantization_config
+    assert hf_config.markov_rank == 256
+    assert hf_config.dflash_config["causal"] is False
+
+
+@pytest.mark.cpu_test
 def test_mtp_stages_are_independent_of_dspark_width():
     hf_kwargs = dict(
         model_type="deepseek_v4", num_nextn_predict_layers=3, dspark_block_size=5
