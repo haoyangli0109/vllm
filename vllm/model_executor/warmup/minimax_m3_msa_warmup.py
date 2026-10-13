@@ -6,6 +6,9 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from vllm.logger import init_logger
+from vllm.model_executor.warmup.attention_warmup import (
+    mixed_batch_attention_warmup,
+)
 from vllm.models.minimax_m3.nvidia.indexer_msa import MiniMaxM3IndexerMSAImpl
 from vllm.models.minimax_m3.nvidia.indexer_nvfp4 import MiniMaxM3IndexerNvfp4Impl
 from vllm.models.minimax_m3.nvidia.model import MiniMaxM3SparseAttention
@@ -105,10 +108,4 @@ def minimax_m3_msa_warmup(worker: "Worker") -> None:
 
     # Cover sparse prefill (and its CuTe-DSL kernels) through the normal model
     # path.
-    worker.model_runner._dummy_run(
-        num_tokens=16,
-        skip_eplb=True,
-        is_profile=True,
-        force_attention=True,
-        create_mixed_batch=True,
-    )
+    mixed_batch_attention_warmup(worker)

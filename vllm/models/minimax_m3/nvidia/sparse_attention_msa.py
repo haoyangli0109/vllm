@@ -378,7 +378,11 @@ class MiniMaxM3SparseMSAImpl(MiniMaxM3SparseMSABaseImpl):
             k2q_row_ptr, k2q_q_indices, schedule = self._build_prefill_csr(
                 topk, nd, num_tokens, p
             )
-            qp = self._bf16_query(q[nd:], q_scale_float, output.dtype)
+            # An E4M3 query attends as is, its scale folded into softmax_scale.
+            qp = q[nd:]
+            softmax_scale = (
+                self.scale * q_scale_float if self.use_cutlass_decode else self.scale
+            )
             k_cache, v_cache = kv_cache.split(self.head_size, dim=-1)
             sparse_atten_func(
                 qp,
@@ -389,7 +393,7 @@ class MiniMaxM3SparseMSAImpl(MiniMaxM3SparseMSABaseImpl):
                 topK=self.topk_blocks,
                 blk_kv=SPARSE_BLOCK_SIZE,
                 causal=True,
-                softmax_scale=self.scale,
+                softmax_scale=softmax_scale,
                 cu_seqlens_q=p.cu_seqlens_q,
                 cu_seqlens_k=p.cu_seqlens_k,
                 max_seqlen_q=p.max_query_len,
