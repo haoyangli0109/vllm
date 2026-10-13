@@ -428,6 +428,9 @@ def test_context_kv_uses_quantized_projection_fallback(monkeypatch):
     model._normalize_context_states = MethodType(
         qwen3_dflash.DFlashQwen3Model._normalize_context_states, model
     )
+    model._project_context_kv_token_major = MethodType(
+        qwen3_dflash.DFlashQwen3Model._project_context_kv_token_major, model
+    )
     layers_attn = [
         SimpleNamespace(
             qkv_proj=projection,

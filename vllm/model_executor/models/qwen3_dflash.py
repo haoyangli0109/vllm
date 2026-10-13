@@ -639,14 +639,15 @@ class DFlashQwen3Model(nn.Module):
         )
         return normed_context_states
 
-    def _project_context_kv(
+    def _project_context_kv_token_major(
         self,
         context_states: torch.Tensor,
         num_ctx: int,
         num_layers: int,
         num_kv_heads: int,
         head_dim: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
+        """Context K/V of every layer, ``[num_ctx, L, 2, nkv, hd]``."""
         # --- Fused KV projection (one GEMM for all layers) ---
         normed_context_states = self._normalize_context_states(context_states)
         if self._fused_kv_weight is not None:
@@ -668,7 +669,19 @@ class DFlashQwen3Model(nn.Module):
                     qkv[:, q_size:].view(num_ctx, 2, num_kv_heads, head_dim)
                 )
             all_kv = torch.stack(layer_kv, dim=1)
+        return all_kv
 
+    def _project_context_kv(
+        self,
+        context_states: torch.Tensor,
+        num_ctx: int,
+        num_layers: int,
+        num_kv_heads: int,
+        head_dim: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        all_kv = self._project_context_kv_token_major(
+            context_states, num_ctx, num_layers, num_kv_heads, head_dim
+        )
         # Single contiguous copy that separates K/V and transposes to
         # layer-major layout. Result: [2, L, num_ctx, nkv, hd] contiguous.
         # Indexing dim-0 gives contiguous [L, num_ctx, nkv, hd] for K and V.

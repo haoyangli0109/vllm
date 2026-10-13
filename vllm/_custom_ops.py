@@ -2655,6 +2655,46 @@ def fused_minimax_m3_qknorm_rope_kv_insert(
     )
 
 
+def fused_minimax_m3_dspark_context_kv(
+    all_kv: torch.Tensor,
+    k_norm_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    kv_cache: torch.Tensor,
+    cache_offsets: torch.Tensor,
+    k_scale: torch.Tensor,
+    scale_offsets: torch.Tensor,
+    rotary_dim: int,
+    eps: float,
+    kv_cache_dtype: str,
+) -> None:
+    """Store the MiniMax-M3 DSpark draft's context K/V for every layer.
+
+    ``all_kv`` ``[N, L, 2, nkv, 128]`` holds each layer's K and V. K gets the
+    layer's Gemma RMSNorm (``k_norm_weight[L, 128]``) and partial NeoX RoPE;
+    both are stored like ``reshape_and_cache_flash`` into the layers' caches.
+    Layer ``l``'s cache is ``kv_cache`` (layer 0, ``[nb, nkv, bs, 2 * 128]``)
+    shifted by ``cache_offsets[l]`` elements; its fp8 k/v scales are
+    ``k_scale`` (layer 0's) shifted by ``scale_offsets[0, l]`` /
+    ``scale_offsets[1, l]`` floats. Slots < 0 are skipped.
+    """
+    torch.ops._C.fused_minimax_m3_dspark_context_kv(
+        all_kv,
+        k_norm_weight,
+        cos_sin_cache,
+        positions,
+        slot_mapping,
+        kv_cache,
+        cache_offsets,
+        k_scale,
+        scale_offsets,
+        rotary_dim,
+        eps,
+        kv_cache_dtype,
+    )
+
+
 def fused_kda_decode(
     x: torch.Tensor,
     weight: torch.Tensor,

@@ -516,6 +516,15 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "Tensor!? q_fp8_out=None, float q_fp8_scale=1.0, "
       "Tensor? kv_k_scale=None, Tensor? kv_v_scale=None) -> ()");
 
+  // MiniMax-M3 DSpark draft: Gemma k-norm + partial NeoX RoPE + K/V cache
+  // insert for every draft layer's context K/V in one launch.
+  ops.def(
+      "fused_minimax_m3_dspark_context_kv("
+      "Tensor all_kv, Tensor k_norm_weight, Tensor cos_sin_cache, "
+      "Tensor positions, Tensor slot_mapping, Tensor! kv_cache, "
+      "Tensor cache_offsets, Tensor k_scale, Tensor scale_offsets, "
+      "int rotary_dim, float eps, str kv_cache_dtype) -> ()");
+
 #ifdef VLLM_ENABLE_FUSED_KDA_DECODE
   ops.def(
       "fused_kda_decode("
@@ -834,6 +843,8 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
 #endif
   ops.impl("fused_minimax_m3_qknorm_rope_kv_insert",
            TORCH_BOX(&fused_minimax_m3_qknorm_rope_kv_insert));
+  ops.impl("fused_minimax_m3_dspark_context_kv",
+           TORCH_BOX(&fused_minimax_m3_dspark_context_kv));
 #ifdef VLLM_ENABLE_FUSED_KDA_DECODE
   ops.impl("fused_kda_decode", TORCH_BOX(&fused_kda_decode));
 #endif

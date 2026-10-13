@@ -385,6 +385,17 @@ void fused_minimax_m3_qknorm_rope_kv_insert(
     std::optional<torch::stable::Tensor> kv_k_scale,
     std::optional<torch::stable::Tensor> kv_v_scale);
 
+void fused_minimax_m3_dspark_context_kv(
+    torch::stable::Tensor const& all_kv,
+    torch::stable::Tensor const& k_norm_weight,
+    torch::stable::Tensor const& cos_sin_cache,
+    torch::stable::Tensor const& positions,
+    torch::stable::Tensor const& slot_mapping, torch::stable::Tensor& kv_cache,
+    torch::stable::Tensor const& cache_offsets,
+    torch::stable::Tensor const& k_scale,
+    torch::stable::Tensor const& scale_offsets, int64_t rotary_dim, double eps,
+    const std::string& kv_cache_dtype);
+
 #ifdef VLLM_ENABLE_FUSED_KDA_DECODE
 void fused_kda_decode(
     torch::stable::Tensor const& x, torch::stable::Tensor const& weight,

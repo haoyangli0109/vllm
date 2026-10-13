@@ -51,6 +51,7 @@
 #include <cmath>
 #include <cuda_runtime.h>
 #include <type_traits>
+#include <limits>
 
 #include "torch_utils.h"
 
@@ -935,6 +936,319 @@ void launchFusedMiniMaxM3(
 #undef LAUNCH
 }
 
+#ifndef USE_ROCM
+// ────────────────────────────────────────────────────────────────────────────
+// DSpark draft context K/V: every draft layer in one launch (bf16 in).
+// ────────────────────────────────────────────────────────────────────────────
+// The draft projects the target's context states to the K/V of all its layers
+// with one GEMM, ``all_kv [N, L, 2, nkv, 128]``. blockIdx.z picks the layer,
+// blockIdx.y the head, blockIdx.x a run of tokens. Eight lanes own one token;
+// lane l holds two 8-dim chunks of K and of V, A = dims [8l, 8l + 8) and
+// B = dims [64 + 8l, 64 + 8l + 8), so with rotary_dim == 64 every lane rotates
+// its A chunk (partner lane l ^ 4) and no lane idles through the RoPE. K gets
+// the layer's Gemma k-norm (rounded to bf16 like the unfused norm) and partial
+// NeoX RoPE (fp32 math rounded once, like rotary_embedding); K and V go into
+// the token's cache row like reshape_and_cache_flash (fp8: e4m3(bf16(x) *
+// (1 / scale)); a unit scale converts the bf16 pairs directly).
+// Layer caches are separate allocations of one layout, logical shape
+// [nb, nkv, bs, 2*128] with K at [..., :128] and V at [..., 128:]; they are
+// addressed as layer 0's cache plus a per-layer element offset (likewise the
+// fp8 k/v scales from layer 0's k scale), so the launch is CUDA-graph safe.
+constexpr int kCtxLanesPerRow = 8;
+constexpr int kCtxElems = 8;  // bf16 per 16-byte chunk
+constexpr int kCtxHalfVecs = kHeadDim / 2 / kCtxElems;  // 8: chunk B offset
+constexpr int kCtxBlockSize = 256;
+constexpr int kCtxRowsPerBlock = kCtxBlockSize / kCtxLanesPerRow;  // 32
+
+__device__ __forceinline__ float bf16lo(uint32_t v) {
+  return __uint_as_float(v << 16);
+}
+__device__ __forceinline__ float bf16hi(uint32_t v) {
+  return __uint_as_float(v & 0xffff0000u);
+}
+__device__ __forceinline__ uint32_t packBf16(float lo, float hi) {
+  __nv_bfloat162 const r = __floats2bfloat162_rn(lo, hi);
+  return *reinterpret_cast<uint32_t const*>(&r);
+}
+// Loads of what the PDL predecessor may still be writing: coherent (an .nc
+// load may be hoisted above griddepcontrol.wait).
+__device__ __forceinline__ uint4 ldgV4(uint4 const* p) {
+  uint4 r;
+  asm volatile("ld.global.v4.u32 {%0, %1, %2, %3}, [%4];"
+               : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w)
+               : "l"(p));
+  return r;
+}
+// Low 32 bits of an int64 (positions and slots fit).
+__device__ __forceinline__ int ldgLo32(int64_t const* p) {
+  int r;
+  asm volatile("ld.global.b32 %0, [%1];" : "=r"(r) : "l"(p));
+  return r;
+}
+// Same approximation as flashinfer's gemma_rmsnorm.
+__device__ __forceinline__ float rsqrtApproxFtz(float x) {
+  float r;
+  asm("rsqrt.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(x));
+  return r;
+}
+// e4m3 of four floats, low byte first.
+__device__ __forceinline__ uint32_t packE4m3(float a, float b, float c,
+                                             float d) {
+  #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
+  uint32_t r;
+  asm("{\n"
+      "  .reg .b16 lo, hi;\n"
+      "  cvt.rn.satfinite.e4m3x2.f32 lo, %2, %1;\n"
+      "  cvt.rn.satfinite.e4m3x2.f32 hi, %4, %3;\n"
+      "  mov.b32 %0, {lo, hi};\n"
+      "}"
+      : "=r"(r)
+      : "f"(a), "f"(b), "f"(c), "f"(d));
+  return r;
+  #else
+  uint32_t const lo =
+      __nv_cvt_float2_to_fp8x2(make_float2(a, b), __NV_SATFINITE, __NV_E4M3);
+  uint32_t const hi =
+      __nv_cvt_float2_to_fp8x2(make_float2(c, d), __NV_SATFINITE, __NV_E4M3);
+  return lo | (hi << 16);
+  #endif
+}
+// Eight bf16 (4 packed pairs) * inv_scale -> e4m3, low byte first.
+__device__ __forceinline__ uint2 bf16x8ToE4m3(uint4 const p,
+                                              float const inv_scale) {
+  uint32_t const w[4] = {p.x, p.y, p.z, p.w};
+  uint32_t r[2];
+  #pragma unroll
+  for (int i = 0; i < 2; i++) {
+    r[i] = packE4m3(bf16lo(w[2 * i]) * inv_scale, bf16hi(w[2 * i]) * inv_scale,
+                    bf16lo(w[2 * i + 1]) * inv_scale,
+                    bf16hi(w[2 * i + 1]) * inv_scale);
+  }
+  return make_uint2(r[0], r[1]);
+}
+  #if (defined(__CUDA_ARCH_FAMILY_SPECIFIC__) && \
+       __CUDA_ARCH_FAMILY_SPECIFIC__ >= 1000) || \
+      (defined(__CUDA_ARCH_SPECIFIC__) && __CUDA_ARCH_SPECIFIC__ >= 1000)
+    #define VLLM_CTX_KV_BF16X2_TO_E4M3X2
+  #endif
+// Eight bf16 -> e4m3 with a unit scale (exact); one convert per pair where
+// the arch converts bf16x2 -> e4m3x2.
+__device__ __forceinline__ uint2 bf16x8ToE4m3(uint4 const p) {
+  #ifdef VLLM_CTX_KV_BF16X2_TO_E4M3X2
+  uint32_t r[2];
+  uint32_t const w[4] = {p.x, p.y, p.z, p.w};
+    #pragma unroll
+  for (int i = 0; i < 2; i++) {
+    asm("{\n"
+        "  .reg .b16 lo, hi;\n"
+        "  cvt.rn.satfinite.e4m3x2.bf16x2 lo, %1;\n"
+        "  cvt.rn.satfinite.e4m3x2.bf16x2 hi, %2;\n"
+        "  mov.b32 %0, {lo, hi};\n"
+        "}"
+        : "=r"(r[i])
+        : "r"(w[2 * i]), "r"(w[2 * i + 1]));
+  }
+  return make_uint2(r[0], r[1]);
+  #else
+  return bf16x8ToE4m3(p, 1.0f);
+  #endif
+}
+
+template <bool kFp8>
+__global__ void __launch_bounds__(kCtxBlockSize)
+    fusedMiniMaxM3DSparkContextKVKernel(
+        uint4 const* __restrict__ all_kv,           // bf16 [N, L, 2, nkv, 128]
+        uint4 const* __restrict__ k_norm_w,         // bf16 [L, 128]
+        uint4 const* __restrict__ cos_sin_cache,    // bf16 [max_pos, rot]
+        int64_t const* __restrict__ positions,      // [N]
+        int64_t const* __restrict__ slot_mapping,   // [N], < 0: no write
+        uint8_t* __restrict__ kv_cache,             // layer 0's cache, bytes
+        int64_t const* __restrict__ cache_offsets,  // [L] elements from it
+        float const* __restrict__ scales,           // layer 0's k scale
+        int64_t const* __restrict__ scale_offsets,  // [2, L] k, v; floats
+        float const eps, int const rotary_dim, int const num_tokens,
+        int const num_layers, int const block_shift, int const s_token,
+        int const s_layer, int const s_side, int const s_head,
+        int const kv_s_block, int const kv_s_head, int const kv_s_token) {
+  // Strides are in 16-byte (8 x bf16) units for all_kv / cos_sin, elements
+  // for the cache.
+  constexpr int kElemBytes = kFp8 ? 1 : 2;
+  int const row0 = blockIdx.x * kCtxRowsPerBlock;
+  // Warps with no token exit; the others run their tail rows too (the
+  // shuffles need every lane) and skip the store.
+  if (row0 + threadIdx.x / 32 * (32 / kCtxLanesPerRow) >= num_tokens) return;
+  int const head = blockIdx.y;
+  int const layer = blockIdx.z;
+  int const lane = threadIdx.x % kCtxLanesPerRow;
+  int const dim0 = lane * kCtxElems;  // chunk A; chunk B is 64 dims later
+  int const t = row0 + threadIdx.x / kCtxLanesPerRow;
+
+  int const half = rotary_dim / 2;
+  bool const in_rope = dim0 < rotary_dim;
+  bool const first_half = dim0 < half;
+  int const cs_vec =
+      in_rope ? (first_half ? dim0 : dim0 - half) / kCtxElems : 0;
+  int const lane_xor = half / kCtxElems;
+  int const rot_vecs = rotary_dim / kCtxElems;
+  // x * cos - partner * sin in the first half, + in the second.
+  uint32_t const sin_sign = first_half ? 0x80008000u : 0u;
+
+  uint8_t* const cache =
+      kv_cache + (cache_offsets[layer] + head * kv_s_head + dim0) * kElemBytes;
+  float k_scale = 1.0f, v_scale = 1.0f;
+  if constexpr (kFp8) {
+    int64_t const k_off = scale_offsets[layer];
+    int64_t const v_off = scale_offsets[num_layers + layer];
+    k_scale = scales[k_off];
+    v_scale = scales[v_off];
+  }
+  float g[2][kCtxElems];  // 1 + w, chunks A and B
+  #pragma unroll
+  for (int c = 0; c < 2; c++) {
+    uint4 const w =
+        k_norm_w[layer * (kHeadDim / kCtxElems) + c * kCtxHalfVecs + lane];
+    uint32_t const wp[4] = {w.x, w.y, w.z, w.w};
+  #pragma unroll
+    for (int i = 0; i < 4; i++) {
+      g[c][2 * i] = 1.0f + bf16lo(wp[i]);
+      g[c][2 * i + 1] = 1.0f + bf16hi(wp[i]);
+    }
+  }
+
+  #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+  cudaGridDependencySynchronize();
+  #endif
+
+  bool const valid = t < num_tokens;
+  int const ts = valid ? t : 0;
+  int const pos = ldgLo32(positions + ts);
+  int const slot = valid ? ldgLo32(slot_mapping + ts) : -1;
+  uint4 const* const src =
+      all_kv + ts * s_token + layer * s_layer + head * s_head + lane;
+  uint4 kr[2], vr[2];
+  #pragma unroll
+  for (int c = 0; c < 2; c++) {
+    kr[c] = ldgV4(src + c * kCtxHalfVecs);
+    vr[c] = ldgV4(src + s_side + c * kCtxHalfVecs);
+  }
+  // Lanes past the rotary dims load (and later discard) a valid row too.
+  uint4 const* const cs = cos_sin_cache + pos * rot_vecs + cs_vec;
+  uint4 const cr = cs[0];
+  uint4 const sr = cs[lane_xor];
+
+  bool const store = slot >= 0;
+  // Power-of-two block size: shift and mask, not division.
+  uint8_t* const dst =
+      cache + (static_cast<int64_t>(slot >> block_shift) * kv_s_block +
+               (slot & ((1 << block_shift) - 1)) * kv_s_token) *
+                  kElemBytes;
+  constexpr int kChunkB = kHeadDim / 2 * kElemBytes;
+  constexpr int kV = kHeadDim * kElemBytes;
+  float const k_inv = __fdividef(1.0f, k_scale);
+  float const v_inv = __fdividef(1.0f, v_scale);
+  #ifdef VLLM_CTX_KV_BF16X2_TO_E4M3X2
+  bool const unit_scale = k_scale == 1.0f && v_scale == 1.0f;
+  #else
+  constexpr bool unit_scale = false;
+  #endif
+  // Eight bf16 -> the cache row at byte offset `off`.
+  auto put = [&](int const off, uint4 const x, float const inv_scale) {
+    if constexpr (kFp8) {
+      uint2 const y = unit_scale ? bf16x8ToE4m3(x) : bf16x8ToE4m3(x, inv_scale);
+      if (store) *reinterpret_cast<uint2*>(dst + off) = y;
+    } else {
+      if (store) *reinterpret_cast<uint4*>(dst + off) = x;
+    }
+  };
+
+  // V first, so its registers free up before the K math.
+  #pragma unroll
+  for (int c = 0; c < 2; c++) put(kV + c * kChunkB, vr[c], v_inv);
+
+  // K: Gemma RMSNorm over the 8 lanes of the row.
+  float x[2][kCtxElems];
+  float sumsq = 0.0f;
+  #pragma unroll
+  for (int c = 0; c < 2; c++) {
+    uint32_t const kp[4] = {kr[c].x, kr[c].y, kr[c].z, kr[c].w};
+  #pragma unroll
+    for (int j = 0; j < 4; j++) {
+      x[c][2 * j] = bf16lo(kp[j]);
+      x[c][2 * j + 1] = bf16hi(kp[j]);
+      sumsq = fmaf(x[c][2 * j], x[c][2 * j], sumsq);
+      sumsq = fmaf(x[c][2 * j + 1], x[c][2 * j + 1], sumsq);
+    }
+  }
+  #pragma unroll
+  for (int mask = kCtxLanesPerRow / 2; mask > 0; mask >>= 1) {
+    sumsq += __shfl_xor_sync(FINAL_MASK, sumsq, mask, 32);
+  }
+  float const rr = rsqrtApproxFtz(sumsq * (1.0f / kHeadDim) + eps);
+  // bf16-rounded norm output, packed.
+  uint32_t kn[2][4];
+  #pragma unroll
+  for (int c = 0; c < 2; c++) {
+  #pragma unroll
+    for (int j = 0; j < 4; j++) {
+      kn[c][j] = packBf16(x[c][2 * j] * rr * g[c][2 * j],
+                          x[c][2 * j + 1] * rr * g[c][2 * j + 1]);
+    }
+  }
+  // RoPE on chunk A; the partner chunk is half / 8 lanes away.
+  uint32_t const cp[4] = {cr.x, cr.y, cr.z, cr.w};
+  uint32_t const sp[4] = {sr.x ^ sin_sign, sr.y ^ sin_sign, sr.z ^ sin_sign,
+                          sr.w ^ sin_sign};
+  #pragma unroll
+  for (int j = 0; j < 4; j++) {
+    uint32_t const pn = __shfl_xor_sync(FINAL_MASK, kn[0][j], lane_xor, 32);
+    uint32_t const rot =
+        packBf16(__fmaf_rn(bf16lo(kn[0][j]), bf16lo(cp[j]),
+                           __fmul_rn(bf16lo(pn), bf16lo(sp[j]))),
+                 __fmaf_rn(bf16hi(kn[0][j]), bf16hi(cp[j]),
+                           __fmul_rn(bf16hi(pn), bf16hi(sp[j]))));
+    kn[0][j] = in_rope ? rot : kn[0][j];
+  }
+  #pragma unroll
+  for (int c = 0; c < 2; c++) {
+    put(c * kChunkB, make_uint4(kn[c][0], kn[c][1], kn[c][2], kn[c][3]), k_inv);
+  }
+
+  #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+  cudaTriggerProgrammaticLaunchCompletion();
+  #endif
+}
+
+template <bool kFp8>
+void launchFusedMiniMaxM3DSparkContextKV(
+    uint4 const* all_kv, uint4 const* k_norm_w, uint4 const* cos_sin_cache,
+    int64_t const* positions, int64_t const* slot_mapping, uint8_t* kv_cache,
+    int64_t const* cache_offsets, float const* scales,
+    int64_t const* scale_offsets, float const eps, int const rotary_dim,
+    int const num_tokens, int const num_layers, int const nkv,
+    int const block_shift, int const s_token, int const s_layer,
+    int const s_side, int const s_head, int const kv_s_block,
+    int const kv_s_head, int const kv_s_token, cudaStream_t stream) {
+  if (num_tokens == 0) return;
+  static int const sm_version = getSMVersion();
+  cudaLaunchConfig_t config;
+  config.gridDim = dim3((num_tokens + kCtxRowsPerBlock - 1) / kCtxRowsPerBlock,
+                        nkv, num_layers);
+  config.blockDim = dim3(kCtxBlockSize);
+  config.dynamicSmemBytes = 0;
+  config.stream = stream;
+  cudaLaunchAttribute attrs[1];
+  attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attrs[0].val.programmaticStreamSerializationAllowed = 1;
+  config.attrs = attrs;
+  config.numAttrs = (sm_version >= 90) ? 1 : 0;
+  cudaLaunchKernelEx(&config, fusedMiniMaxM3DSparkContextKVKernel<kFp8>, all_kv,
+                     k_norm_w, cos_sin_cache, positions, slot_mapping, kv_cache,
+                     cache_offsets, scales, scale_offsets, eps, rotary_dim,
+                     num_tokens, num_layers, block_shift, s_token, s_layer,
+                     s_side, s_head, kv_s_block, kv_s_head, kv_s_token);
+}
+#endif  // !USE_ROCM
+
 }  // namespace minimax_m3_fused_ops
 }  // namespace vllm
 
@@ -1265,3 +1579,122 @@ void fused_minimax_m3_qknorm_rope_kv_insert(
 
 #undef CALL_FUSED_MINIMAX_M3
 #undef CALL_FUSED_MINIMAX_M3_IMPL
+
+// ────────────────────────────────────────────────────────────────────────────
+// DSpark context K/V torch op
+// ────────────────────────────────────────────────────────────────────────────
+void fused_minimax_m3_dspark_context_kv(
+    torch::stable::Tensor const& all_kv,         // bf16 [N, L, 2, nkv, 128]
+    torch::stable::Tensor const& k_norm_weight,  // bf16 [L, 128]
+    torch::stable::Tensor const& cos_sin_cache,  // bf16 [max_pos, rotary_dim]
+    torch::stable::Tensor const& positions,      // [N] i64
+    torch::stable::Tensor const& slot_mapping,   // [N] i64
+    torch::stable::Tensor& kv_cache,  // layer 0's [nb, nkv, bs, 2*128]
+    torch::stable::Tensor const& cache_offsets,  // [L] i64, elements
+    torch::stable::Tensor const& k_scale,        // layer 0's [] f32 k scale
+    torch::stable::Tensor const& scale_offsets,  // [2, L] i64, floats
+    int64_t rotary_dim, double eps, const std::string& kv_cache_dtype) {
+#ifdef USE_ROCM
+  STD_TORCH_CHECK(false, "fused_minimax_m3_dspark_context_kv is CUDA-only");
+#else
+  using torch::headeronly::ScalarType;
+  int const kHeadDim = vllm::minimax_m3_fused_ops::kHeadDim;
+  STD_TORCH_CHECK(all_kv.is_cuda() && all_kv.dim() == 5 &&
+                      all_kv.size(2) == 2 && all_kv.size(4) == kHeadDim &&
+                      all_kv.stride(4) == 1 &&
+                      all_kv.scalar_type() == ScalarType::BFloat16,
+                  "all_kv must be bf16 CUDA [N, L, 2, nkv, 128], last dim "
+                  "contiguous");
+  for (int d = 0; d < 4; d++) {
+    STD_TORCH_CHECK(all_kv.stride(d) % 8 == 0,
+                    "all_kv strides must be multiples of 8 elements");
+  }
+  STD_TORCH_CHECK(reinterpret_cast<uintptr_t>(all_kv.data_ptr()) % 16 == 0,
+                  "all_kv must be 16-byte aligned");
+  int const num_tokens = static_cast<int>(all_kv.size(0));
+  int const num_layers = static_cast<int>(all_kv.size(1));
+  int const nkv = static_cast<int>(all_kv.size(3));
+  STD_TORCH_CHECK(k_norm_weight.is_contiguous() &&
+                      k_norm_weight.scalar_type() == ScalarType::BFloat16 &&
+                      k_norm_weight.numel() == num_layers * kHeadDim,
+                  "k_norm_weight must be contiguous bf16 [L, 128]");
+  STD_TORCH_CHECK(cos_sin_cache.is_contiguous() &&
+                      cos_sin_cache.scalar_type() == ScalarType::BFloat16 &&
+                      cos_sin_cache.dim() == 2 &&
+                      cos_sin_cache.size(1) == rotary_dim,
+                  "cos_sin_cache must be contiguous bf16 [max_pos, "
+                  "rotary_dim]");
+  STD_TORCH_CHECK(rotary_dim == 16 || rotary_dim == 32 || rotary_dim == 64,
+                  "rotary_dim must be 16, 32 or 64");
+  for (auto const* t : {&positions, &slot_mapping}) {
+    STD_TORCH_CHECK(t->is_cuda() && t->is_contiguous() &&
+                        t->scalar_type() == ScalarType::Long &&
+                        t->numel() == num_tokens,
+                    "positions and slot_mapping must be contiguous int64 [N]");
+  }
+  STD_TORCH_CHECK(cache_offsets.is_cuda() && cache_offsets.is_contiguous() &&
+                      cache_offsets.scalar_type() == ScalarType::Long &&
+                      cache_offsets.numel() == num_layers,
+                  "cache_offsets must be int64 [L]");
+  STD_TORCH_CHECK(scale_offsets.is_cuda() && scale_offsets.is_contiguous() &&
+                      scale_offsets.scalar_type() == ScalarType::Long &&
+                      scale_offsets.numel() == 2 * num_layers,
+                  "scale_offsets must be int64 [2, L]");
+  STD_TORCH_CHECK(
+      k_scale.is_cuda() && k_scale.scalar_type() == ScalarType::Float,
+      "k_scale must be a float32 CUDA tensor");
+  bool const fp8 = kv_cache_dtype == "fp8" || kv_cache_dtype == "fp8_e4m3";
+  STD_TORCH_CHECK(fp8 || kv_cache_dtype == "auto",
+                  "kv_cache_dtype must be auto, fp8 or fp8_e4m3");
+  STD_TORCH_CHECK(fp8 ? kv_cache.scalar_type() == ScalarType::Byte
+                      : kv_cache.scalar_type() == ScalarType::BFloat16,
+                  "kv_cache must be uint8 (fp8) or bf16 (auto)");
+  STD_TORCH_CHECK(
+      kv_cache.dim() == 4 && kv_cache.size(1) == nkv &&
+          kv_cache.size(3) == 2 * kHeadDim && kv_cache.stride(3) == 1 &&
+          kv_cache.stride(0) % 16 == 0 && kv_cache.stride(1) % 16 == 0 &&
+          kv_cache.stride(2) % 16 == 0,
+      "kv_cache must be [nb, nkv, bs, 256] with a contiguous last dim");
+  int64_t const block_size = kv_cache.size(2);
+  STD_TORCH_CHECK(block_size > 0 && (block_size & (block_size - 1)) == 0,
+                  "kv_cache block size must be a power of two");
+  int block_shift = 0;
+  while ((int64_t{1} << block_shift) < block_size) block_shift++;
+  int64_t constexpr kIntMax = std::numeric_limits<int>::max();
+  STD_TORCH_CHECK(all_kv.numel() / 8 <= kIntMax &&
+                      kv_cache.stride(0) <= kIntMax &&
+                      kv_cache.size(0) * block_size <= kIntMax,
+                  "all_kv / kv_cache too large for 32-bit indexing");
+
+  const torch::stable::accelerator::DeviceGuard device_guard(
+      all_kv.get_device_index());
+  auto stream = get_current_cuda_stream(all_kv.get_device_index());
+  // all_kv strides in 16-byte vectors.
+  auto launch = [&](auto fp8_tag) {
+    constexpr bool kFp8 = decltype(fp8_tag)::value;
+    vllm::minimax_m3_fused_ops::launchFusedMiniMaxM3DSparkContextKV<kFp8>(
+        reinterpret_cast<uint4 const*>(all_kv.data_ptr()),
+        reinterpret_cast<uint4 const*>(k_norm_weight.data_ptr()),
+        reinterpret_cast<uint4 const*>(cos_sin_cache.data_ptr()),
+        reinterpret_cast<int64_t const*>(positions.data_ptr()),
+        reinterpret_cast<int64_t const*>(slot_mapping.data_ptr()),
+        reinterpret_cast<uint8_t*>(kv_cache.data_ptr()),
+        reinterpret_cast<int64_t const*>(cache_offsets.data_ptr()),
+        reinterpret_cast<float const*>(k_scale.data_ptr()),
+        reinterpret_cast<int64_t const*>(scale_offsets.data_ptr()),
+        static_cast<float>(eps), static_cast<int>(rotary_dim), num_tokens,
+        num_layers, nkv, block_shift, static_cast<int>(all_kv.stride(0) / 8),
+        static_cast<int>(all_kv.stride(1) / 8),
+        static_cast<int>(all_kv.stride(2) / 8),
+        static_cast<int>(all_kv.stride(3) / 8),
+        static_cast<int>(kv_cache.stride(0)),
+        static_cast<int>(kv_cache.stride(1)),
+        static_cast<int>(kv_cache.stride(2)), stream);
+  };
+  if (fp8) {
+    launch(std::true_type{});
+  } else {
+    launch(std::false_type{});
+  }
+#endif
+}

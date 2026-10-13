@@ -13,6 +13,7 @@ from collections.abc import Iterable
 import torch
 from torch import nn
 
+from vllm import _custom_ops as ops
 from vllm.config import CacheConfig, VllmConfig
 from vllm.model_executor.layers.activation import SiluAndMulWithClamp
 from vllm.model_executor.layers.linear import (
@@ -30,10 +31,29 @@ from vllm.model_executor.models.qwen3_dspark import (
     Qwen3DSparkModel,
 )
 from vllm.model_executor.models.utils import WeightsMapper
+from vllm.models.minimax_m3.common.ops.dspark_context_kv import (
+    DSparkContextKVWriter,
+    rotary_dims_supported,
+)
 from vllm.platforms import current_platform
 from vllm.transformers_utils.configs.minimax_m3 import MiniMaxM3TextConfig
 
 _CHECKPOINT_PREFIX = "language_model.model.dspark."
+
+
+def _shared_slot_mapping(
+    slot_mapping: torch.Tensor | list[torch.Tensor | None] | None,
+) -> torch.Tensor | None:
+    """The context slot mapping when every draft layer shares it, else None
+    (dummy runs, and drafts whose layers span several KV cache groups)."""
+    if slot_mapping is None or isinstance(slot_mapping, torch.Tensor):
+        return slot_mapping
+    first = slot_mapping[0]
+    if first is None or any(
+        s is None or s.data_ptr() != first.data_ptr() for s in slot_mapping
+    ):
+        return None
+    return first
 
 
 def _gemma_rms_norm(hidden_size: int, eps: float) -> nn.Module:
@@ -79,6 +99,31 @@ class MiniMaxM3DSparkAttention(DFlashQwen3Attention):
         )
         self.q_norm = _gemma_rms_norm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = _gemma_rms_norm(self.head_dim, eps=config.rms_norm_eps)
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        qkv, _ = self.qkv_proj(hidden_states)
+        # The target's fused per-head Gemma QK-norm + partial NeoX RoPE on q/k,
+        # in place: one launch instead of the q-norm, k-norm and RoPE kernels.
+        ops.fused_minimax_m3_qknorm_rope_kv_insert(
+            qkv,
+            self.q_norm.weight,
+            self.k_norm.weight,
+            self.rotary_emb.cos_sin_cache,
+            positions,
+            self.num_heads,
+            self.num_kv_heads,
+            self.rotary_emb.rotary_dim,
+            self.q_norm.variance_epsilon,
+            kv_cache_dtype="auto",
+        )
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        attn_output = self.attn(q, k, v)
+        output, _ = self.o_proj(attn_output)
+        return output
 
 
 class MiniMaxM3DSparkMLP(nn.Module):
@@ -179,6 +224,62 @@ class MiniMaxM3DSparkModel(Qwen3DSparkModel):
     def _normalize_context_k(self, all_k: torch.Tensor) -> torch.Tensor:
         return torch.stack(
             [layer.self_attn.k_norm(k) for layer, k in zip(self.layers, all_k)]
+        )
+
+    def _context_kv_writer(self) -> DSparkContextKVWriter | None:
+        """The fused context K/V writer, or None where the base path runs."""
+        if not hasattr(self, "_ctx_kv_writer"):
+            if any(a.kv_cache.numel() == 0 for a in self._attn_layers):
+                return None  # KV caches not bound yet: decide once they are
+            rotary_dim = self._rope_cos_sin_cache.shape[-1]
+            supported = (
+                self._rope_is_neox
+                and self.layers[0].self_attn.v_scale is None
+                and rotary_dims_supported(rotary_dim, self._head_dim)
+                and self._rope_cos_sin_cache.dtype == torch.bfloat16
+                and DSparkContextKVWriter.supported(self._attn_layers)
+            )
+            self._ctx_kv_writer = (
+                DSparkContextKVWriter(self._attn_layers) if supported else None
+            )
+        return self._ctx_kv_writer
+
+    def precompute_and_store_context_kv(
+        self,
+        context_states: torch.Tensor,
+        context_positions: torch.Tensor,
+        context_slot_mapping: torch.Tensor | list[torch.Tensor | None] | None = None,
+    ) -> None:
+        """One kernel norms, ropes and stores the context K/V of every layer,
+        straight from the projection output."""
+        slot_mapping = _shared_slot_mapping(context_slot_mapping)
+        writer = (
+            self._context_kv_writer()
+            if slot_mapping is not None
+            and hasattr(self, "_num_attn_layers")
+            and context_states.dtype == torch.bfloat16
+            else None
+        )
+        if writer is None:
+            super().precompute_and_store_context_kv(
+                context_states, context_positions, context_slot_mapping
+            )
+            return
+        all_kv = self._project_context_kv_token_major(
+            context_states,
+            context_states.shape[0],
+            self._num_attn_layers,
+            self._num_kv_heads,
+            self._head_dim,
+        )
+        writer(
+            all_kv,
+            self._k_norm_weights,
+            self._rms_norm_eps,
+            context_positions,
+            self._rope_cos_sin_cache,
+            self._rope_cos_sin_cache.shape[-1],
+            slot_mapping,
         )
 
 
