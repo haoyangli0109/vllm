@@ -91,6 +91,9 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
 from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
     requantize_nvfp4_moe_weight,
 )
+from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
+    dequantize_nvfp4_moe_weights,
+)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     FP4_DTYPE,
     QuantKey,
@@ -110,7 +113,10 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     requantize_with_max_scale,
 )
-from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from vllm.model_executor.parameter import (
     BlockQuantScaleParameter,
     ChannelQuantScaleParameter,
@@ -123,6 +129,7 @@ from vllm.model_executor.utils import (
     set_weight_attrs,
 )
 from vllm.platforms import current_platform
+from vllm.utils.b12x import B12X_BLOCK_CODECS
 from vllm.utils.math_utils import cdiv
 
 if TYPE_CHECKING:
@@ -896,6 +903,22 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
     def uses_weight_scale_2_pattern(self) -> bool:
         """FP4 variants use 'weight_scale_2' pattern for per-tensor weight scales."""
         return True
+
+    def dequantize_weight(
+        self, layer: torch.nn.Module
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Materialize serialized ModelOpt NVFP4 expert weights."""
+        return dequantize_nvfp4_moe_weights(
+            layer.w13_weight,
+            layer.w13_weight_scale,
+            layer.w13_weight_scale_2,
+            layer.w2_weight,
+            layer.w2_weight_scale,
+            layer.w2_weight_scale_2,
+            layer.params_dtype,
+            group_size=self.quant_config.group_size,
+            invert_global_scales=False,
+        )
 
     def create_weights(
         self,
@@ -1932,6 +1955,19 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
         super().__init__(exclude_modules)
         self.kv_cache_quant_method = kv_cache_quant_method
         self.quantized_layers = quantized_layers
+        for prefix, recipe in quantized_layers.items():
+            codec = recipe.get("quant_algo", "").lower()
+            if codec in B12X_BLOCK_CODECS and any(
+                recipe.get(key) != value
+                for key, value in {
+                    "group_size": B12X_BLOCK_CODECS[codec][0],
+                    "block_payload_bytes": B12X_BLOCK_CODECS[codec][1],
+                    "packing": "ggml",
+                }.items()
+            ):
+                raise ValueError(
+                    f"unsupported {codec.upper()} block contract for {prefix}: {recipe}"
+                )
         self.fp8_config = fp8_config
         self.nvfp4_config = nvfp4_config
         self.w4a16_nvfp4_config = w4a16_nvfp4_config
@@ -2183,6 +2219,22 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
             return None
 
         quant_algo = self._resolve_quant_algo(prefix)
+
+        if quant_algo is not None and quant_algo.lower() in B12X_BLOCK_CODECS:
+            from .modelopt_block_quant import (
+                ModelOptBlockQuantLinearMethod,
+                ModelOptBlockQuantMoEMethod,
+            )
+
+            if isinstance(layer, RoutedExperts):
+                return ModelOptBlockQuantMoEMethod(
+                    layer.moe_config, codec=quant_algo.lower()
+                )
+            if isinstance(layer, (LinearBase, VocabParallelEmbedding)):
+                return ModelOptBlockQuantLinearMethod(codec=quant_algo.lower())
+            raise ValueError(
+                f"{quant_algo} requires a linear, embedding or routed experts"
+            )
 
         if isinstance(layer, (LinearBase, ParallelLMHead)):
             # Per-prefix algo -> its sub-config, then the generic linear method.

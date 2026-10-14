@@ -13,6 +13,7 @@ Q8KV4 kernels.
 """
 
 import functools
+import os
 from dataclasses import dataclass, replace
 from typing import ClassVar
 
@@ -73,6 +74,11 @@ def _q8kv4_prefill_blocker(
         output_maxscore=False,
         device=None,
     )
+
+
+def _get_msa_cutlass_min_batch_size() -> int | None:
+    value = os.getenv("VLLM_MINIMAX_M3_MSA_CUTLASS_MIN_BATCH")
+    return int(value) if value is not None else None
 
 
 def _dequantize_query(
@@ -164,6 +170,7 @@ class MiniMaxM3SparseMSAMetadataBuilder(MiniMaxM3SparseMetadataBuilder):
             num_kv_heads=self.num_kv_heads,
         )
         self.msa_cutlass_plan_cache = MSACutlassDecodePlanCache()
+        self.msa_cutlass_min_batch_size = _get_msa_cutlass_min_batch_size()
 
     def build(
         self,
@@ -190,6 +197,7 @@ class MiniMaxM3SparseMSAMetadataBuilder(MiniMaxM3SparseMetadataBuilder):
             kv_cache_dtype=self.kv_cache_dtype,
             page_size=SPARSE_BLOCK_SIZE,
             topk_blocks=self.topk_blocks,
+            min_batch_size=self.msa_cutlass_min_batch_size,
         ):
             seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound
             assert seq_lens_cpu is not None
