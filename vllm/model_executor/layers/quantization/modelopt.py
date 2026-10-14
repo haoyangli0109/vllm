@@ -89,10 +89,8 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     nvfp4_moe_weight_to_mxfp8,
 )
 from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
-    requantize_nvfp4_moe_weight,
-)
-from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
     dequantize_nvfp4_moe_weights,
+    requantize_nvfp4_moe_weight,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     FP4_DTYPE,
