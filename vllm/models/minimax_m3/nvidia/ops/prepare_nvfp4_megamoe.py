@@ -85,7 +85,11 @@ def _prepare_nvfp4_megamoe_inputs_kernel(
         mx_bits = mx_scale.to(tl.uint32, bitcast=True)
         mx_exp = ((mx_bits >> 23) & 0xFF) + ((mx_bits & 0x7FFFFF) != 0).to(tl.uint32)
         mx_exp = tl.minimum(tl.maximum(mx_exp, 1), 254)
-        mx_inv_scale = 1.0 / (mx_exp << 23).to(tl.float32, bitcast=True)
+        # The scale is 2^(mx_exp - 127), so its reciprocal is the biased
+        # exponent 254 - mx_exp: an integer subtract instead of a divide, exact
+        # for the mx_exp <= 247 a finite BF16 row can reach (``_ue8m0_inverse``
+        # in finalize_allreduce_norm uses the same identity).
+        mx_inv_scale = ((254 - mx_exp) << 23).to(tl.float32, bitcast=True)
         mx_scaled = tl.reshape(hidden, [MX_GROUPS, MX_GROUP]) * mx_inv_scale[:, None]
         tl.store(
             shared_x + token_id * shared_x_stride_m + k_offsets,

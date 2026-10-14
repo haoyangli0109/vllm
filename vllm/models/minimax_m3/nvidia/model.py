@@ -65,7 +65,10 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
-from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp8Dynamic
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    kMxfp8Dynamic,
+    kNvfp4DynamicToken,
+)
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -343,6 +346,10 @@ class MiniMaxM3MoE(nn.Module):
             swiglu_beta=config.swiglu_beta,
             routed_scaling_factor=self.routed_scaling_factor,
             router_logits_dtype=self.gate.out_dtype,
+            # The NVFP4 routed experts are QAT'd with a per-token FC1 input
+            # scale; their ``input_global_scale`` is a 1.0 placeholder that
+            # the quantization config cannot tell from a calibrated scale.
+            qat_activation_key=kNvfp4DynamicToken,
             shared_experts=self.shared_experts,
             quant_config=quant_config,
             reduce_results=reduce_results,

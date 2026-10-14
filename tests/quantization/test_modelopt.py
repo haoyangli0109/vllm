@@ -178,11 +178,46 @@ def test_modelopt_mxfp8_routes_nvfp4_experts_to_compressed_tensors(monkeypatch):
     layer = Mock(spec=RoutedExperts)
     layer.moe_config = Mock()
     prefix = "model.layers.3.block_sparse_moe.experts"
-    assert config.get_quant_method(layer, prefix) is ct_method.return_value
-    ct_method.assert_called_once_with(layer.moe_config, layer_name=prefix)
+
+    # MiniMax-M3.1 declares that it QAT'd the FC1 input per token, leaving a
+    # neutral 1.0 input_global_scale. A model that declares nothing keeps the
+    # checkpoint's per-tensor scale.
+    for declared, expected in (
+        (kNvfp4DynamicToken, kNvfp4DynamicToken),
+        (None, kNvfp4Dynamic),
+    ):
+        ct_method.reset_mock()
+        layer.moe_config.qat_activation_key = declared
+        assert config.get_quant_method(layer, prefix) is ct_method.return_value
+        ct_method.assert_called_once_with(
+            layer.moe_config, layer_name=prefix, activation_key=expected
+        )
 
     plain = ModelOptMxFp8Config.from_config({"quant_method": "mxfp8"})
     assert plain.moe_quant_algo is None
+
+
+def test_per_token_nvfp4_moe_backends_match_the_experts_that_implement_it():
+    """``make_nvfp4_moe_kernel`` dispatches unquantized inputs for a per-token
+    scheme and only forwards ``per_token_activation`` to this set, so it has to
+    be exactly the experts that take that argument. ``_supports_quant_scheme``
+    cannot be used for the check: several NVFP4 backends match on the weight
+    key alone and accept any activation key."""
+    import inspect
+
+    from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
+        PER_TOKEN_NVFP4_MOE_BACKENDS,
+        NvFp4MoeBackend,
+        backend_to_kernel_cls,
+    )
+
+    implementing = {
+        backend
+        for backend in NvFp4MoeBackend
+        for cls in backend_to_kernel_cls(backend)
+        if "per_token_activation" in inspect.signature(cls.__init__).parameters
+    }
+    assert implementing == PER_TOKEN_NVFP4_MOE_BACKENDS
 
 
 def test_modelopt_mxfp8_requantizes_nvfp4_experts_on_rocm(monkeypatch):

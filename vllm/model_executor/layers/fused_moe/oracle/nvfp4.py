@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from enum import Enum
+from typing import Any
 
 import torch
 
@@ -53,6 +54,15 @@ class NvFp4MoeBackend(Enum):
     EMULATION = "EMULATION"
     FLASHINFER_MOE_EP_CUTEDSL = "FLASHINFER_MOE_EP_CUTEDSL"
 
+
+# Backends whose experts quantize the MoE input themselves, with one scale per
+# token. ``make_nvfp4_moe_kernel`` only hands ``per_token_activation`` to these.
+PER_TOKEN_NVFP4_MOE_BACKENDS = frozenset(
+    {
+        NvFp4MoeBackend.FLASHINFER_CUTEDSL,
+        NvFp4MoeBackend.FLASHINFER_TRTLLM,
+    }
+)
 
 FLASHINFER_NVFP4_MOE_BACKENDS = [
     NvFp4MoeBackend.FLASHINFER_TRTLLM,
@@ -628,15 +638,17 @@ def make_nvfp4_moe_kernel(
 
     logger.info_once("Using %s", prepare_finalize.__class__.__name__)
 
-    extra_kwargs = {}
-    if (
-        backend
-        in (
-            NvFp4MoeBackend.FLASHINFER_TRTLLM,
-            NvFp4MoeBackend.FLASHINFER_CUTEDSL,
-        )
-        and per_token_activation
-    ):
+    extra_kwargs: dict[str, Any] = {}
+    if per_token_activation:
+        # Prepare dispatched the input unquantized, so an expert that does
+        # not quantize it itself would read garbage. The backend selection
+        # does not catch this: several NVFP4 experts match on the weight key
+        # alone and accept any activation key.
+        if backend not in PER_TOKEN_NVFP4_MOE_BACKENDS:
+            raise ValueError(
+                f"Per-token NVFP4 activation scales are not supported by "
+                f"{backend.value}."
+            )
         extra_kwargs["per_token_activation"] = True
 
     # Create Experts.

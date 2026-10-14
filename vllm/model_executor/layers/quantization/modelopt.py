@@ -1319,8 +1319,12 @@ class ModelOptMxFp8Config(ModelOptQuantConfigBase):
                 CompressedTensorsW4A4Nvfp4MoEMethod,
             )
 
+            # Nothing in the checkpoint says how its FC1 input was
+            # quantized during QAT, so the model declares it.
             return CompressedTensorsW4A4Nvfp4MoEMethod(
-                layer.moe_config, layer_name=prefix
+                layer.moe_config,
+                layer_name=prefix,
+                activation_key=(layer.moe_config.qat_activation_key or kNvfp4Dynamic),
             )
         return super().get_quant_method(layer, prefix)
 
