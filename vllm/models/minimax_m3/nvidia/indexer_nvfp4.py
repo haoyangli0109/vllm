@@ -39,6 +39,11 @@ from vllm.models.minimax_m3.common.indexer import (
     MiniMaxM3IndexerMetadata,
     MiniMaxM3IndexerMetadataBuilder,
 )
+from vllm.models.minimax_m3.nvidia.indexer_nvfp4_decode_cp import (
+    Nvfp4DecodeCPLayer,
+    Nvfp4DecodeCPPlan,
+    get_nvfp4_indexer_decode_cp,
+)
 from vllm.models.minimax_m3.nvidia.ops.gather_nvfp4_index_k import (
     minimax_m3_gather_nvfp4_index_k_fp8,
 )
@@ -46,6 +51,7 @@ from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import (
     AttentionBackend,
     CommonAttentionMetadata,
+    max_decode_query_len,
 )
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.kv_cache_interface import AttentionSpec
@@ -94,9 +100,11 @@ class MiniMaxM3IndexerNvfp4Backend(MiniMaxM3IndexerBackend):
 
 @dataclass
 class MiniMaxM3IndexerNvfp4DecodeMetadata:
-    wrapper: Any  # planned CUDA-graph BatchDecodeIndexerQ8KV4Wrapper
+    wrapper: Any  # planned CUDA-graph wrapper, None when decode CP is on
     num_reqs: int  # includes zero-length full-CUDA-graph padding requests
     query_len: int  # uniform, <= DECODE_QUERY_LEN
+    # Set instead of the wrapper when decode CP is on.
+    cp_plan: Nvfp4DecodeCPPlan | None = None
 
 
 @dataclass
@@ -149,6 +157,11 @@ class MiniMaxM3IndexerNvfp4MetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
         self.max_gather_pages = max_gather_pages(vllm_config)
         # Decode wrapper per padded decode batch size and query length.
         self.decode_wrappers: dict[tuple[int, int], Any] = {}
+        # Decode CP (opt-in); static, so all ranks and graphs agree.
+        self.decode_cp = get_nvfp4_indexer_decode_cp(
+            num_index_heads=self.num_index_heads,
+            max_decode_query_len=self.max_decode_query_len,
+        )
 
     def _decode_wrapper(
         self, block_table: torch.Tensor, seq_lens: torch.Tensor, query_len: int
@@ -202,17 +215,28 @@ class MiniMaxM3IndexerNvfp4MetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
             query_len = int(query_lens_cpu[0])
             assert torch.all((query_lens_cpu == query_len) | (query_lens_cpu == 0))
             num_pages = min(block_table.shape[1], MAX_PAGES)
-            decode_block_table = block_table[:num_decodes, :num_pages]
-            decode_seq_lens = seq_lens[:num_decodes]
-            wrapper = self._decode_wrapper(
-                decode_block_table, decode_seq_lens, query_len
-            )
-            wrapper.plan(decode_block_table, decode_seq_lens, query_len=query_len)
-            decode = MiniMaxM3IndexerNvfp4DecodeMetadata(
-                wrapper=wrapper,
-                num_reqs=num_decodes,
-                query_len=query_len,
-            )
+            if self.decode_cp is not None:
+                decode = MiniMaxM3IndexerNvfp4DecodeMetadata(
+                    wrapper=None,
+                    num_reqs=num_decodes,
+                    query_len=query_len,
+                    cp_plan=self.decode_cp.plan(
+                        block_table[:num_decodes, :num_pages],
+                        seq_lens[:num_decodes],
+                    ),
+                )
+            else:
+                decode_block_table = block_table[:num_decodes, :num_pages]
+                decode_seq_lens = seq_lens[:num_decodes]
+                wrapper = self._decode_wrapper(
+                    decode_block_table, decode_seq_lens, query_len
+                )
+                wrapper.plan(decode_block_table, decode_seq_lens, query_len=query_len)
+                decode = MiniMaxM3IndexerNvfp4DecodeMetadata(
+                    wrapper=wrapper,
+                    num_reqs=num_decodes,
+                    query_len=query_len,
+                )
 
         prefill_chunks: list[MiniMaxM3IndexerNvfp4PrefillChunk] = []
         if num_prefills > 0:
@@ -350,7 +374,16 @@ class MiniMaxM3IndexerNvfp4Impl(MiniMaxM3IndexerImpl):
                 "local_blocks, block_size, index_head_dim, score_type)="
                 f"{config}."
             )
-        self.max_gather_pages = max_gather_pages(get_current_vllm_config())
+        vllm_config = get_current_vllm_config()
+        self.max_gather_pages = max_gather_pages(vllm_config)
+        # Per-layer decode-CP buffers (collective: same layer order on all ranks).
+        self.decode_cp = get_nvfp4_indexer_decode_cp(
+            num_index_heads=self.num_index_heads,
+            max_decode_query_len=max_decode_query_len(vllm_config),
+        )
+        self.decode_cp_layer: Nvfp4DecodeCPLayer | None = (
+            None if self.decode_cp is None else self.decode_cp.new_layer()
+        )
 
     def reserve_workspace(self) -> None:
         current_workspace_manager().get_simultaneous(
@@ -381,7 +414,18 @@ class MiniMaxM3IndexerNvfp4Impl(MiniMaxM3IndexerImpl):
         if md.decode_q8kv4 is not None:
             d = md.decode_q8kv4
             rows = d.num_reqs * d.query_len
-            d.wrapper.run(index_q[:rows], kv, out=buf[:rows])
+            if d.cp_plan is not None:
+                assert self.decode_cp is not None and self.decode_cp_layer is not None
+                self.decode_cp.forward(
+                    self.decode_cp_layer,
+                    d.cp_plan,
+                    index_q[:rows],
+                    kv,
+                    buf[:rows],
+                    d.query_len,
+                )
+            else:
+                d.wrapper.run(index_q[:rows], kv, out=buf[:rows])
         for chunk in md.prefill_chunks:
             self._prefill(
                 index_q[nd + chunk.token_start : nd + chunk.token_end],
