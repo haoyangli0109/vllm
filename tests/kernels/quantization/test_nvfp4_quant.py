@@ -344,36 +344,3 @@ def test_quantize_to_fp4_padded_no_sf_swizzled(pad_shape: tuple[int, int]) -> No
     out_ans = cast_from_fp4(out, m, n)
     torch.testing.assert_close(out_ans, out_ref)
     torch.testing.assert_close(scale_ans, scale_ref)
-
-
-@pytest.mark.parametrize("shape", [(1, 6144), (37, 512), (300, 6144), (2048, 3072)])
-@torch.inference_mode()
-def test_nvfp4_row_quantize(shape: tuple[int, int]) -> None:
-    """Per-row outer-scale NVFP4 (MiniMax-M3.1 FC1 input) across rows spanning
-    nine decades, zero rows and outliers. The kernel's div.full / rcp.approx
-    PTX may differ from the IEEE reference in the last ulp, so only a tiny
-    share of bytes may disagree."""
-    from vllm.model_executor.layers.quantization.utils.nvfp4_row_quant import (
-        nvfp4_row_quantize,
-        nvfp4_row_quantize_ref,
-    )
-
-    set_random_seed(42)
-    m, n = shape
-    x = (
-        torch.randn(m, n, device="cuda")
-        * torch.logspace(-6, 3, m, device="cuda")[:, None]
-    )
-    x[0, :64] = 0
-    if m > 2:
-        x[1] = 0
-        x[2, 3] = 100 * x[2].abs().max()
-    x = x.to(torch.bfloat16)
-
-    x_fp4, x_sf, x_scale = nvfp4_row_quantize(x)
-    ref_fp4, ref_sf, ref_scale = nvfp4_row_quantize_ref(x)
-
-    assert x_fp4.shape == (m, n // 2) and x_sf.shape == (m, n // 16)
-    torch.testing.assert_close(x_scale, ref_scale, atol=0, rtol=0)
-    assert (x_fp4 != ref_fp4).float().mean() < 1e-4
-    assert (x_sf.view(torch.uint8) != ref_sf.view(torch.uint8)).float().mean() < 1e-3
