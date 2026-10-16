@@ -16,11 +16,14 @@ from torch import nn
 from vllm import _custom_ops as ops
 from vllm.config import CacheConfig, VllmConfig
 from vllm.model_executor.layers.activation import SiluAndMulWithClamp
+from vllm.model_executor.layers.attention.attention import get_attention_context
+from vllm.model_executor.layers.fusion.quant_activation import get_input_quant_key
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     RowParallelLinear,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp8Dynamic
 from vllm.model_executor.models.qwen3_dflash import (
     DFlashQwen3Attention,
     DFlashQwen3DecoderLayer,
@@ -79,6 +82,7 @@ class MiniMaxM3DSparkAttention(DFlashQwen3Attention):
         cache_config: CacheConfig | None,
         quant_config: QuantizationConfig | None,
         prefix: str,
+        query_pre_quantized: bool = False,
     ) -> None:
         super().__init__(
             hidden_size=config.hidden_size,
@@ -96,9 +100,23 @@ class MiniMaxM3DSparkAttention(DFlashQwen3Attention):
             cache_config=cache_config,
             quant_config=quant_config,
             prefix=prefix,
+            query_pre_quantized=query_pre_quantized,
         )
         self.q_norm = _gemma_rms_norm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = _gemma_rms_norm(self.head_dim, eps=config.rms_norm_eps)
+        # With an FP8 KV cache the backend wants an FP8 query, and the fused
+        # kernel below can write one. Producing it there instead of letting the
+        # attention layer quantize afterwards saves a pass over q.
+        self._emit_fp8_query = query_pre_quantized
+        # FLASHINFER_TS writes an FP8 query's output as FP16 (FA4 only bf16);
+        # an MXFP8 o_proj quantizes FP16 as readily and writes the model dtype.
+        self._attn_output_dtype = (
+            torch.float16
+            if query_pre_quantized
+            and self.attn.attn_backend.get_name() == "FLASHINFER_TS"
+            and get_input_quant_key(self.o_proj) == kMxfp8Dynamic
+            else None
+        )
 
     def forward(
         self,
@@ -108,6 +126,20 @@ class MiniMaxM3DSparkAttention(DFlashQwen3Attention):
         qkv, _ = self.qkv_proj(hidden_states)
         # The target's fused per-head Gemma QK-norm + partial NeoX RoPE on q/k,
         # in place: one launch instead of the q-norm, k-norm and RoPE kernels.
+        # q_fp8_out additionally stores the normed/roped q as E4M3, which is
+        # what an FP8-KV backend consumes.
+        q_fp8 = (
+            torch.empty(
+                (qkv.shape[0], self.q_size),
+                dtype=current_platform.fp8_dtype(),
+                device=qkv.device,
+            )
+            if self._emit_fp8_query
+            else None
+        )
+        # Also stores the draft tokens' k/v, so the attention layer gets q alone.
+        _, layer, kv_cache, slot_mapping = get_attention_context(self.attn.layer_name)
+        insert = slot_mapping is not None
         ops.fused_minimax_m3_qknorm_rope_kv_insert(
             qkv,
             self.q_norm.weight,
@@ -118,10 +150,19 @@ class MiniMaxM3DSparkAttention(DFlashQwen3Attention):
             self.num_kv_heads,
             self.rotary_emb.rotary_dim,
             self.q_norm.variance_epsilon,
-            kv_cache_dtype="auto",
+            slot_mapping=slot_mapping,
+            kv_cache=kv_cache if insert else None,
+            block_size=kv_cache.size(2) if insert else 0,
+            kv_cache_dtype="fp8" if kv_cache.dtype == torch.uint8 else "auto",
+            q_fp8_out=q_fp8,
+            q_fp8_scale=layer._q_scale_float,
         )
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        attn_output = self.attn(q, k, v)
+        q = qkv[:, : self.q_size] if q_fp8 is None else q_fp8
+        # output_dtype must be stated: it otherwise follows the query, which
+        # may be FP8.
+        attn_output = self.attn(
+            q, None, None, output_dtype=self._attn_output_dtype or hidden_states.dtype
+        )
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -184,6 +225,9 @@ class MiniMaxM3DSparkDecoderLayer(DFlashQwen3DecoderLayer):
             raise NotImplementedError("MiniMax DSpark supports dense FFN drafts only.")
         self.hidden_size = config.hidden_size
         sliding_window, causal = _resolve_layer_attention(config, layer_idx)
+        # An FP8 draft cache means the backend reads an FP8 query, which the
+        # fused QK-norm/RoPE kernel emits directly.
+        kv_cache_dtype = getattr(cache_config, "cache_dtype", "auto")
         self.self_attn = MiniMaxM3DSparkAttention(
             config,
             sliding_window=sliding_window,
@@ -191,6 +235,7 @@ class MiniMaxM3DSparkDecoderLayer(DFlashQwen3DecoderLayer):
             cache_config=cache_config,
             quant_config=quant_config,
             prefix=f"{prefix}.self_attn",
+            query_pre_quantized=str(kv_cache_dtype).startswith("fp8"),
         )
         self.mlp = MiniMaxM3DSparkMLP(config, quant_config, prefix=f"{prefix}.mlp")
         hidden_size, eps = config.hidden_size, config.rms_norm_eps

@@ -554,7 +554,7 @@ __device__ __forceinline__ void storeNvfp4CacheElems(
 // Slots per token:
 //     Q : nq                            (always — norm+RoPE)
 //     K : nkv                           (always — norm+RoPE; +K-cache insert)
-//     V : nkv  only if kInsertKV        (V-cache insert; no warps in dense)
+//     V : nkv  only if kInsertKV        (V-cache insert)
 //     IQ: niq  only if kProcessIndex    (norm+RoPE)
 //     IK: 1    only if kProcessIndex    (norm+RoPE; +index-cache insert)
 // cache_t/kv_dt: main attention KV-cache dtype (auto/fp8). out_idx_t/kFp8Idx:
@@ -613,7 +613,8 @@ __global__ void fusedMiniMaxM3QNormRopeKVInsertKernel(
     static_assert(!kNvfp4Idx || (kFp8Idx && kInsertKV),
                   "NVFP4 index cache requires fp8 index-Q and cache insert");
 
-    // Slot layout (compile-time gated: dense has neither V nor index slots).
+    // Slot layout (compile-time gated: V slots only when inserting, index
+    // slots only on the sparse layer).
     int const v_slots = kInsertKV ? nkv : 0;
     int const idx_slots = kProcessIndex ? niq + 1 : 0;
     int const slots_per_token = nq + nkv + v_slots + idx_slots;
@@ -751,7 +752,7 @@ __global__ void fusedMiniMaxM3QNormRopeKVInsertKernel(
       }
     }
 
-    // ── Cache inserts (sparse serving only). ───────────────────────────────
+    // ── Cache inserts. ─────────────────────────────────────────────────────
     if constexpr (kInsertKV) {
       // Guard (not early-return) so every thread reaches the PDL trigger below.
       int64_t sm = -1;
@@ -796,6 +797,15 @@ __global__ void fusedMiniMaxM3QNormRopeKVInsertKernel(
           int64_t const off = b * kv_s_block + head * kv_s_head +
                               t * kv_s_token +
                               (kv * kHeadDim + dim_base) * kv_s_dim;
+          if constexpr (!kHasIndex) {
+            // Dense layers stand in for reshape_and_cache_flash, which
+            // quantizes the k already materialized in the model dtype.
+            using Converter = vllm::_typeConvert<scalar_t>;
+#pragma unroll
+            for (int i = 0; i < kElemsPerLane; i++) {
+              elems[i] = Converter::convert(Converter::convert(elems[i]));
+            }
+          }
           storeCacheElems<scalar_t, cache_t, kv_dt>(kv_cache + off, elems);
         }
       }
@@ -928,10 +938,10 @@ void launchFusedMiniMaxM3(
                scalar_t);  // sparse profiling, bf16
       }
     }
+  } else if (insert_kv) {
+    LAUNCH(false, true, false, false, false, scalar_t);  // dense, KV insert
   } else {
-    // Dense layer: never has an index branch and never inserts here (the
-    // generic Attention layer owns the KV insert).
-    LAUNCH(false, false, false, false, false, scalar_t);
+    LAUNCH(false, false, false, false, false, scalar_t);  // dense
   }
 #undef LAUNCH
 }
@@ -1371,11 +1381,8 @@ void fused_minimax_m3_qknorm_rope_kv_insert(
                   " + num_index_heads + 1) * 128 for sparse, "
                   "(num_heads + 2*num_kv_heads) * 128 for dense");
 
-  // Only the sparse layer inserts here (dense lets the generic Attention layer
-  // own the KV write); there is no dense+insert kernel instantiation.
-  STD_TORCH_CHECK(
-      !insert_kv || has_index,
-      "insert mode (kv_cache) requires the index branch (sparse layer)");
+  STD_TORCH_CHECK(!nvfp4_kv || has_index,
+                  "nvfp4 kv_cache requires the index branch (sparse layer)");
   STD_TORCH_CHECK(has_index || !skip_index_branch,
                   "skip_index_branch requires sparse qkv rows");
   if (process_index) {

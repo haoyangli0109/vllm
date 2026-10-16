@@ -21,6 +21,7 @@ import vllm._custom_ops as ops
 from vllm.models.minimax_m3.common.ops.dspark_context_kv import (
     DSparkContextKVWriter,
 )
+from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_default_torch_dtype
 
 flashinfer_norm = pytest.importorskip("flashinfer.norm")
@@ -257,16 +258,39 @@ def test_dspark_context_kv_cuda_graph(kv_cache_dtype):
             assert_bf16_close(a.kv_cache, b.kv_cache)
 
 
+def test_dspark_context_kv_supported_by_cache_layout():
+    """The writer engages on the [nb, nkv, bs, 2 * 128] page that FLASH_ATTN
+    and FLASHINFER_TS share, whatever the backend, and not on a 5-D cache."""
+    layers = build_layers("fp8", 5, 1, 4, "cuda", seed=0, unit_scale=True)
+    assert DSparkContextKVWriter.supported(layers)
+    layers[0].kv_cache = torch.zeros(
+        4, 2, BLOCK_SIZE, 1, HEAD_DIM, dtype=torch.uint8, device="cuda"
+    )
+    assert not DSparkContextKVWriter.supported(layers)
+
+
 class _CaptureAttention(torch.nn.Module):
     """Stands in for the draft's Attention: records the q/k/v it is given."""
 
-    def forward(self, q, k, v):
-        self.qkv = (q.clone(), k.clone(), v.clone())
-        return torch.zeros_like(q)
+    _q_scale_float = 1.0
+
+    def __init__(self, layer_name):
+        super().__init__()
+        self.layer_name = layer_name
+
+    def forward(self, q, k, v, output_dtype=None):
+        self.qkv = tuple(None if t is None else t.clone() for t in (q, k, v))
+        return torch.zeros_like(q, dtype=output_dtype)
 
 
-def test_draft_attention_fused_qk_norm_rope(dist_init, default_vllm_config):
-    """One fused launch gives the q/k/v of DFlash's q-norm, k-norm and RoPE."""
+@pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8"])
+def test_draft_attention_fused_qk_norm_rope(
+    dist_init, default_vllm_config, kv_cache_dtype
+):
+    """One fused launch gives the q of DFlash's q-norm and RoPE and stores its
+    k/v in a bf16 or fp8 cache as the layer's reshape_and_cache_flash would;
+    the attention layer gets q alone."""
+    from vllm.forward_context import set_forward_context
     from vllm.model_executor.models.qwen3_dflash import DFlashQwen3Attention
     from vllm.models.minimax_m3.common.dspark import MiniMaxM3DSparkAttention
     from vllm.transformers_utils.configs.minimax_m3 import MiniMaxM3TextConfig
@@ -290,12 +314,129 @@ def test_draft_attention_fused_qk_norm_rope(dist_init, default_vllm_config):
         )
     for param in (attn.qkv_proj.weight, attn.q_norm.weight, attn.k_norm.weight):
         param.data.normal_(std=0.05)
-    attn.attn = _CaptureAttention()
+    layer = attn.attn
+    cache_dtype = torch.uint8 if kv_cache_dtype == "fp8" else torch.bfloat16
+    layer.kv_cache = torch.zeros(
+        4, 2, BLOCK_SIZE, 2 * HEAD_DIM, dtype=cache_dtype, device="cuda"
+    )
+    attn.attn = _CaptureAttention(layer.layer_name)
 
     hidden = torch.randn(7, config.hidden_size, device="cuda", dtype=torch.bfloat16)
     positions = torch.tensor([0, 1, 127, 128, 4000, 8190, 9], device="cuda")
+    slots = torch.tensor([5, -1, 17, 18, 40, 63, 0], device="cuda")
     DFlashQwen3Attention.forward(attn, positions, hidden)
-    expected = attn.attn.qkv
-    attn(positions, hidden)
-    for actual, ref in zip(attn.attn.qkv, expected):
-        torch.testing.assert_close(actual, ref, atol=2e-2, rtol=2e-2)
+    q_ref, k_ref, v_ref = attn.attn.qkv
+    with set_forward_context(
+        None, default_vllm_config, slot_mapping={layer.layer_name: slots}
+    ):
+        attn(positions, hidden)
+    q, k, v = attn.attn.qkv
+    torch.testing.assert_close(q, q_ref, atol=2e-2, rtol=2e-2)
+    assert k is None and v is None
+    expected = torch.zeros_like(layer.kv_cache)
+    key_cache, value_cache = expected.transpose(1, 2).split(HEAD_DIM, dim=-1)
+    one = torch.ones((), dtype=torch.float32, device="cuda")
+    ops.reshape_and_cache_flash(
+        k_ref.reshape(7, 2, HEAD_DIM),
+        v_ref.reshape(7, 2, HEAD_DIM),
+        key_cache,
+        value_cache,
+        slots,
+        kv_cache_dtype,
+        one,
+        one,
+    )
+    got, rtol = layer.kv_cache, 2e-2
+    if kv_cache_dtype == "fp8":
+        # k/v_ref come from DFlash's unfused kernels: allow one e4m3 step.
+        got = got.view(torch.float8_e4m3fn).float()
+        expected = expected.view(torch.float8_e4m3fn).float()
+        rtol = 0.13
+    torch.testing.assert_close(got, expected, atol=2e-2, rtol=rtol)
+
+
+class _FixedOutputAttention(torch.nn.Module):
+    """Stands in for the draft's Attention: returns a fixed output in the
+    requested dtype and records the dtypes asked for."""
+
+    def __init__(self, layer_name, out):
+        super().__init__()
+        self.layer_name, self.out, self.output_dtypes = layer_name, out, []
+
+    def forward(self, q, k, v, output_dtype):
+        self.output_dtypes.append(output_dtype)
+        return self.out.to(output_dtype)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability_family(100),
+    reason="Native MXFP8 kernels require SM100-family CUDA",
+)
+@torch.inference_mode()
+def test_draft_fp16_attention_output_feeds_mxfp8_o_proj(dist_init, default_vllm_config):
+    """A backend that writes an FP8 query's output as FP16 hands it to the
+    MXFP8 o_proj without a conversion pass; o_proj quantizes it and still
+    returns bf16, bit-identical to the bf16 path for values both dtypes hold."""
+    from vllm.forward_context import set_forward_context
+    from vllm.model_executor.layers.quantization.modelopt import ModelOptMxFp8Config
+    from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+        _mxfp8_e4m3_quantize_torch,
+    )
+    from vllm.models.minimax_m3.common.dspark import MiniMaxM3DSparkAttention
+    from vllm.transformers_utils.configs.minimax_m3 import MiniMaxM3TextConfig
+
+    torch.manual_seed(0)
+    config = MiniMaxM3TextConfig(
+        hidden_size=512,
+        num_attention_heads=8,
+        num_key_value_heads=2,
+        head_dim=HEAD_DIM,
+        max_position_embeddings=8192,
+    )
+    quant_config = ModelOptMxFp8Config.from_config(
+        {
+            "quant_method": "mxfp8",
+            "activation_scheme": "dynamic",
+            "weight_block_size": [1, 32],
+            "ignored_layers": [],
+        }
+    )
+    with torch.device("cuda"), set_default_torch_dtype(torch.bfloat16):
+        attn = MiniMaxM3DSparkAttention(
+            config,
+            sliding_window=None,
+            causal=False,
+            cache_config=None,
+            quant_config=quant_config,
+            prefix="model.layers.0.self_attn",
+            query_pre_quantized=True,
+        )
+    for proj in (attn.qkv_proj, attn.o_proj):
+        weight, scale = _mxfp8_e4m3_quantize_torch(
+            torch.randn(proj.weight.shape, device="cuda") / 16
+        )
+        proj.weight.data.copy_(weight)
+        proj.weight_scale.data.copy_(scale)
+        proj.quant_method.process_weights_after_loading(proj)
+    layer = attn.attn
+    layer.kv_cache = torch.zeros(
+        4, 2, BLOCK_SIZE, 2 * HEAD_DIM, dtype=torch.uint8, device="cuda"
+    )
+    num_tokens = 7
+    out = torch.randint(-256, 256, (num_tokens, attn.q_size), device="cuda") / 128
+    attn.attn = _FixedOutputAttention(layer.layer_name, out.to(torch.bfloat16))
+
+    hidden = torch.randn(
+        num_tokens, config.hidden_size, device="cuda", dtype=torch.bfloat16
+    )
+    positions = torch.arange(num_tokens, device="cuda")
+    outputs = []
+    for attn_output_dtype in (torch.float16, None):
+        attn._attn_output_dtype = attn_output_dtype
+        with set_forward_context(
+            None, default_vllm_config, slot_mapping={layer.layer_name: positions}
+        ):
+            outputs.append(attn(positions, hidden))
+    assert attn.attn.output_dtypes == [torch.float16, torch.bfloat16]
+    assert outputs[0].dtype == torch.bfloat16
+    torch.testing.assert_close(outputs[0], outputs[1], atol=0, rtol=0)

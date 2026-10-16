@@ -6,7 +6,7 @@ Replaces the permute copy, per-layer K-norm launches + stack, positions.repeat,
 rotary_embedding and per-layer reshape_and_cache_flash calls in
 ``DFlashQwen3Model.precompute_and_store_context_kv``. K/V are read straight
 from the fused projection output ``all_kv`` ``[num_ctx, L, 2, nkv, 128]`` and
-written into each layer's FlashAttention-layout cache
+written into each layer's paged cache (FLASH_ATTN, FLASHINFER_TS)
 ``[num_blocks, nkv, block_size, 2 * 128]`` (K at ``[..., :128]``, V at
 ``[..., 128:]``), matching ``reshape_and_cache_flash``: fp8 e4m3 of
 ``x / scale`` for kv_cache_dtype fp8, raw bf16 otherwise; slots < 0 are padding
@@ -108,14 +108,7 @@ class DSparkContextKVWriter:
             torch.ops._C, "fused_minimax_m3_dspark_context_kv"
         ):
             return False
-        from vllm.v1.attention.backends.flash_attn import FlashAttentionImpl
-
-        layers = list(attn_layers)
-        if any(
-            not isinstance(getattr(a, "impl", None), FlashAttentionImpl) for a in layers
-        ):
-            return False
-        return DSparkContextKVWriter._validate(layers) is None
+        return DSparkContextKVWriter._validate(list(attn_layers)) is None
 
     def _ensure_tables(self) -> None:
         layers = self._layers
