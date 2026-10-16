@@ -133,7 +133,6 @@ if TYPE_CHECKING:
     VLLM_USE_OINK_OPS: bool = False
     VLLM_MXFP4_EMULATION_DEQUANT_AT_LOAD: bool = False
     VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD: bool = True
-    VLLM_NVFP4_MOE_REQUANT: Literal["mxfp8", "mxfp4"] = "mxfp8"
     VLLM_ROCM_USE_AITER: bool = False
     VLLM_ROCM_USE_AITER_CUSTOM_AR: bool = True
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
@@ -1249,15 +1248,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD": lambda: (
         os.getenv("VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD", "True").lower()
         in ("true", "1")
-    ),
-    # Format the NVFP4 routed experts of an MXFP8 checkpoint are re-quantized
-    # to at load on ROCm: "mxfp8" (default, MXFP8 activations) or
-    #                     "mxfp4" (half the expert memory, with higher re-quant error).
-    "VLLM_NVFP4_MOE_REQUANT": env_with_choices(
-        "VLLM_NVFP4_MOE_REQUANT",
-        "mxfp8",
-        ["mxfp8", "mxfp4"],
-        case_sensitive=False,
     ),
     "VLLM_ROCM_USE_AITER": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER", "False").lower() in ("true", "1")

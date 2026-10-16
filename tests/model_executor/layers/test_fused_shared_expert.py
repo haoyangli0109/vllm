@@ -18,6 +18,7 @@ import vllm.config as vllm_config_module
 import vllm.envs as envs
 from vllm.config import ParallelConfig, VllmConfig, set_current_vllm_config
 from vllm.config.quantization import QuantizationConfigArgs
+from vllm.logger import _print_warning_once
 from vllm.model_executor.layers.fused_moe import utils as fused_moe_utils
 from vllm.model_executor.layers.fused_moe.layer import determine_expert_counts
 from vllm.model_executor.layers.quantization.experts_int8 import ExpertsInt8Config
@@ -41,6 +42,13 @@ pytestmark = pytest.mark.skipif(
     current_platform.is_xpu(),
     reason="ROCm-specific aiter ops are not supported on XPU",
 )
+
+
+@pytest.fixture(autouse=True)
+def reset_warning_once():
+    """`logger.warning_once` dedupes across tests: make each test see its warnings."""
+    _print_warning_once.cache_clear()
+
 
 _QUARK_FSE_CONFIG: dict[str, Any] = {
     "global_quant_config": {
@@ -416,6 +424,31 @@ def test_resolve_layer_fused_shared_expert_rejects_incompatible_quantization(
         ExpertsInt8Config(), "model.layers.0.mlp"
     )
     assert "shared experts are excluded" in caplog.text
+
+
+def test_resolve_layer_fused_shared_expert_warns_when_aiter_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(
+        fused_moe_utils,
+        "envs",
+        SimpleNamespace(
+            VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS=True,
+            VLLM_ROCM_USE_AITER=False,
+            VLLM_ROCM_USE_AITER_MOE=True,
+        ),
+    )
+    monkeypatch.setattr(
+        fused_moe_utils.rocm_aiter_ops,
+        "is_fusion_moe_shared_experts_enabled",
+        lambda: False,
+    )
+
+    assert not fused_moe_utils.resolve_layer_fused_shared_expert(
+        ExpertsInt8Config(), "model.layers.0.mlp"
+    )
+    assert "VLLM_ROCM_USE_AITER=1 (currently False)" in caplog.text
 
 
 def test_deepseek_v4_shared_expert_fse_uses_mtp_quantization_config_prefix(
@@ -895,15 +928,12 @@ def test_models_fse_init(
             glm5_next_model, "_fused_shared_experts_tuned", lambda _: True
         )
 
-    import vllm.envs as envs
     from vllm._aiter_ops import rocm_aiter_ops
 
     if model_type == "deepseek_v4":
         from vllm.models.deepseek_v4.amd import model as deepseek_v4_model
 
         warning_logger = deepseek_v4_model.logger
-    elif model_type == "minimax_m3":
-        warning_logger = minimax_m3_model.logger
     else:
         warning_logger = fused_moe_utils.logger
 
@@ -920,11 +950,9 @@ def test_models_fse_init(
         mp.setattr(envs, "VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS", use_fse)
         rocm_aiter_ops.refresh_env_variables()
         aiter_fse_enabled = bool(rocm_aiter_ops.is_fusion_moe_shared_experts_enabled())
-        # These AMD-specific models currently use the raw environment flag.
-        # and do not rely on `rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()`.
-        fse_enabled = use_fse and (
-            aiter_fse_enabled or model_type in {"deepseek_v4", "minimax_m3"}
-        )
+        # This AMD-specific model currently uses the raw environment flag
+        # and does not rely on `rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()`.
+        fse_enabled = use_fse and (aiter_fse_enabled or model_type == "deepseek_v4")
 
         with (
             patch.object(warning_logger, "warning") as warning,
@@ -996,15 +1024,12 @@ def _modelopt_mxfp8_config(exclude_modules=(), moe_quant_algo="NVFP4"):
     ],
 )
 def test_modelopt_mxfp8_shared_expert_fse_compatibility(
-    monkeypatch: pytest.MonkeyPatch, exclude_modules: list[str], expected: bool
+    exclude_modules: list[str], expected: bool
 ) -> None:
-    """With the NVFP4 routed experts re-quantized to MXFP8 (ROCm default), the
-    MXFP8 shared expert can take an expert slot unless either side is excluded
-    from quantization."""
-    monkeypatch.setattr(current_platform, "is_rocm", lambda: True)
-    monkeypatch.setattr(envs, "VLLM_NVFP4_MOE_REQUANT", "mxfp8", raising=False)
+    """With MXFP8 routed experts, the MXFP8 shared expert can take an expert slot
+    unless either side is excluded from quantization."""
     compatible, reason = is_shared_expert_quant_fse_compatible(
-        _modelopt_mxfp8_config(exclude_modules),
+        _modelopt_mxfp8_config(exclude_modules, moe_quant_algo=None),
         "model.layers.0.mlp.experts",
         "model.layers.0.mlp.shared_experts",
     )
@@ -1014,26 +1039,20 @@ def test_modelopt_mxfp8_shared_expert_fse_compatibility(
 
 
 @pytest.mark.parametrize(
-    ("is_rocm", "requant", "moe_quant_algo", "expected"),
+    ("moe_quant_algo", "expected"),
     [
-        # NVFP4 routed experts elsewhere stay NVFP4, next to an MXFP8 shared expert.
-        (False, "mxfp8", "NVFP4", False),
-        # MXFP4 routed experts would re-quantize the MXFP8 shared expert.
-        (True, "mxfp4", "NVFP4", False),
-        # A plain MXFP8 checkpoint (both sides MXFP8) on any platform.
-        (False, "mxfp8", None, True),
+        # NVFP4 routed experts cannot share a slot layout with the MXFP8 shared
+        # expert without online requantization of both.
+        ("NVFP4", False),
+        # A plain MXFP8 checkpoint (both sides MXFP8).
+        (None, True),
     ],
 )
 def test_modelopt_mxfp8_shared_expert_fse_keeps_the_stored_format(
-    monkeypatch: pytest.MonkeyPatch,
-    is_rocm: bool,
-    requant: str,
-    moe_quant_algo: str | None,
-    expected: bool,
+    moe_quant_algo: str | None, expected: bool
 ) -> None:
-    """The shared expert is fused only in the format it is stored in."""
-    monkeypatch.setattr(current_platform, "is_rocm", lambda: is_rocm)
-    monkeypatch.setattr(envs, "VLLM_NVFP4_MOE_REQUANT", requant, raising=False)
+    """Without online requantization, the shared expert is fused only in the
+    format it is stored in."""
     compatible, reason = is_shared_expert_quant_fse_compatible(
         _modelopt_mxfp8_config(moe_quant_algo=moe_quant_algo),
         "model.layers.0.mlp.experts",
@@ -1173,7 +1192,9 @@ def test_online_targets_off_shared_expert_defer_to_checkpoint(
     )
 
 
-def test_online_targeting_only_one_shared_projection_rejects_fse() -> None:
+def test_online_only_one_shared_projection_matching_keys() -> None:
+    """An online target on part of the shared expert is fine as long as every
+    projection runs with the routed experts' keys (MXFP4 here)."""
     shared_prefix = "model.layers.0.mlp.shared_expert"
     quant_config = QuarkConfig({**_QUARK_FSE_CONFIG, "exclude": []})
     quant_config.online_quantization_config = OnlineQuantizationConfig(
@@ -1184,11 +1205,7 @@ def test_online_targeting_only_one_shared_projection_rejects_fse() -> None:
         quant_config,
         "model.layers.0.mlp.experts",
         shared_prefix,
-    ) == (
-        False,
-        "online quantization targets only part of the shared expert at "
-        f"{shared_prefix}",
-    )
+    ) == (True, None)
 
 
 def test_online_fp8_shared_expert_rejects_quark_mxfp4_fse() -> None:
@@ -1198,14 +1215,15 @@ def test_online_fp8_shared_expert_rejects_quark_mxfp4_fse() -> None:
         QuantizationConfigArgs(targets={f"{shared_prefix}*": "fp8_per_tensor"})
     )
 
-    assert is_shared_expert_quant_fse_compatible(
+    compatible, reason = is_shared_expert_quant_fse_compatible(
         quant_config,
         "model.layers.0.mlp.experts",
         shared_prefix,
-    ) == (
-        False,
-        "online shared-expert quantization keys do not match the routed expert keys",
     )
+    assert not compatible
+    assert reason is not None
+    assert reason.startswith("shared expert (weight, activation) keys ")
+    assert f"at {shared_prefix} do not match the routed expert keys" in reason
 
 
 def test_quark_shared_expert_fse_exclude_is_scoped_to_the_layer() -> None:
