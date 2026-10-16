@@ -55,6 +55,7 @@ from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import _unpack
 from vllm.model_executor.layers.fusion.quant_activation import (
     QuantizedActivation,
+    as_quantized_activation,
     get_input_quant_key,
 )
 from vllm.model_executor.layers.linear import (
@@ -65,6 +66,9 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+    mxfp8_e4m3_quantize,
+)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kMxfp8Dynamic,
     kNvfp4DynamicToken,
@@ -127,8 +131,14 @@ from vllm.models.minimax_m3.nvidia.ops.finalize_allreduce_norm import (
     init_fused_moe_finalize,
     supports_fused_moe_finalize,
 )
+from vllm.models.minimax_m3.nvidia.ops.qkv_index_fused_epilogue import (
+    minimax_m3_qkv_index_fused_epilogue,
+    register_qkv_index_fused_epilogue_warmup,
+)
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
+from vllm.utils.flashinfer import is_flashinfer_autotuning
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
 from vllm.v1.kv_cache_interface import (
@@ -143,6 +153,37 @@ logger = init_logger(__name__)
 # all-reduce + input norm + MXFP8 quantization. Larger batches finalize in the
 # MoE and use the regular fused all-reduce + norm.
 FUSED_MOE_FINALIZE_MAX_TOKENS = 32
+
+_QKV_FUSED_EPILOGUE_MIN_TOKENS = 512
+
+
+def _supports_qkv_fused_epilogue(attn: "MiniMaxM3SparseAttention") -> bool:
+    """Whether minimax_m3_qkv_index_fused_epilogue can replace this layer's
+    qkv_proj + norm/RoPE/cache-insert chain."""
+    from vllm.model_executor.kernels.linear.mxfp8.flashinfer import (
+        FlashInferCutedslMxfp8LinearKernel,
+        FlashInferCutlassMxfp8LinearKernel,
+    )
+
+    if not current_platform.is_device_capability_family(100):
+        return False
+    # Both keep the weight K-major and its scales F8_128x4-swizzled.
+    kernel = getattr(attn.qkv_proj.quant_method, "kernel", None)
+    if not isinstance(
+        kernel, (FlashInferCutedslMxfp8LinearKernel, FlashInferCutlassMxfp8LinearKernel)
+    ):
+        return False
+    nkv = attn.num_kv_heads
+    return (
+        attn.use_nvfp4_kv
+        and attn.indexer_kv_dtype == "nvfp4"
+        and nkv in (1, 2, 4)
+        and attn.num_heads == 16 * nkv
+        and attn.num_idx_heads == nkv
+        and attn.head_dim == attn.idx_head_dim == 128
+        and attn.rotary_emb.rotary_dim == 64
+        and attn.hidden_size % 128 == 0
+    )
 
 
 def _sparse_attention_layer_ids(config: PreTrainedConfig) -> set[int]:
@@ -769,6 +810,22 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         compilation_config.static_forward_context[self.layer_name] = self
         self.kv_cache = torch.tensor([])  # replaced by bind_kv_cache
 
+        self.use_qkv_fused_epilogue = _supports_qkv_fused_epilogue(self)
+        if self.use_qkv_fused_epilogue:
+            logger.info_once("MiniMax-M3: QKV+indexer GEMM with fused epilogue enabled")
+            block_size = vllm_config.cache_config.block_size
+            # The query is E4M3-only when CUTLASS decode serves the layer.
+            q_is_fp8 = getattr(self.impl, "use_cutlass_decode", False)
+            if vllm_config.kernel_config.enable_jit_warmup and block_size is not None:
+                register_qkv_index_fused_epilogue_warmup(
+                    has_q=not q_is_fp8,
+                    has_qfp8=q_is_fp8,
+                    nkv=self.num_kv_heads,
+                    block_size=block_size,
+                    weight_bytes=self.qkv_proj.output_size_per_partition
+                    * self.hidden_size,
+                )
+
     def get_attn_backend(self) -> type[MiniMaxM3SparseBackend]:
         return self.attn_backend
 
@@ -783,12 +840,60 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
         )
 
-    def _allocate_query(self, qkv: torch.Tensor) -> torch.Tensor:
+    def _qkv_proj_fused_epilogue(
+        self,
+        hidden_states: torch.Tensor | QuantizedActivation,
+        positions: torch.Tensor,
+        q: torch.Tensor,
+        index_q: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        index_slot_mapping: torch.Tensor,
+    ) -> None:
+        """qkv_proj + QK-norm/RoPE + KV/index-cache insert as one MXFP8 kernel,
+        writing q (bf16 or E4M3, as allocated) and index_q."""
+        weight = self.qkv_proj.weight
+        if weight.shape[1] != self.hidden_size:
+            weight = weight.t()  # the CuTe-DSL kernel keeps a [K, N] view
+        qa = as_quantized_activation(hidden_states, kMxfp8Dynamic)
+        if qa is not None:
+            xq, xsf = qa.data, qa.scale
+        else:
+            assert isinstance(hidden_states, torch.Tensor)
+            xq, xsf = mxfp8_e4m3_quantize(hidden_states, is_sf_swizzled_layout=True)
+        q_is_fp8 = q.dtype == torch.float8_e4m3fn
+        minimax_m3_qkv_index_fused_epilogue(
+            xq,
+            xsf,
+            weight,
+            self.qkv_proj.weight_scale,
+            positions,
+            self.rotary_emb.cos_sin_cache,
+            self.q_norm.weight,
+            self.k_norm.weight,
+            self.index_q_norm.weight,
+            self.index_k_norm.weight,
+            self.q_norm.variance_epsilon,
+            slot_mapping=slot_mapping,
+            index_slot_mapping=index_slot_mapping,
+            kv_cache=self.kv_cache,
+            index_cache=self.indexer.index_cache.kv_cache,
+            q_out=None if q_is_fp8 else q,
+            index_q_out=index_q,
+            q_fp8_out=q if q_is_fp8 else None,
+            q_fp8_scale=self._q_scale_float,
+            k_scale=self._k_scale_float,
+            v_scale=self._v_scale_float,
+        )
+
+    def _allocate_query(
+        self, num_tokens: int, dtype: torch.dtype, device: torch.device
+    ) -> torch.Tensor:
         # CUTLASS decode reads an E4M3 query, so the insert emits only that.
         fp8 = getattr(self.impl, "use_cutlass_decode", False)
-        return qkv.new_empty(
-            (qkv.shape[0], self.q_size),
-            dtype=torch.float8_e4m3fn if fp8 else qkv.dtype,
+        return torch.empty(
+            (num_tokens, self.q_size),
+            dtype=torch.float8_e4m3fn if fp8 else dtype,
+            device=device,
         )
 
     def forward(
@@ -796,23 +901,9 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         positions: torch.Tensor,
         hidden_states: torch.Tensor | QuantizedActivation,
     ) -> torch.Tensor:
-        # Single fused projection emitting [q | k | v | index_q | index_k].
-        qkv, _ = self.qkv_proj(hidden_states)
-
-        # Horizontally-fused per-head Gemma QK-norm + partial NeoX RoPE on the
-        # main (q/k) and index (index_q/index_k) branches, all read straight out
-        # of the single fused ``qkv`` tensor (the "5 results").  Once the paged
-        # caches are bound the kernel also inserts k/v and the index key into
-        # them; the initial memory-profiling run (caches unbound, no slot_mapping)
-        # short-circuits to zeros below. k/v and index_k are rewritten in place
-        # inside qkv (and scatter-inserted into the caches); q and index_q are
-        # de-interleaved
-        # straight into the dedicated contiguous ``q``/``index_q`` buffers below.
-
         cos_sin_cache = self.rotary_emb.cos_sin_cache
         rotary_dim = self.rotary_emb.rotary_dim
         eps = self.q_norm.variance_epsilon
-        num_tokens = qkv.shape[0]
 
         fwd_slot_mapping = get_forward_context().slot_mapping
         if (
@@ -820,47 +911,80 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             or self.layer_name not in fwd_slot_mapping
         ):
             # Memory-profiling run: caches not yet bound, slot_mapping is empty.
+            qkv, _ = self.qkv_proj(hidden_states)
             self.indexer.reserve_workspace()
-            return qkv.new_zeros((num_tokens, self.hidden_size))
+            return qkv.new_zeros((qkv.shape[0], self.hidden_size))
 
         main_slot_mapping = fwd_slot_mapping[self.layer_name]
         index_slot_mapping = fwd_slot_mapping[self.indexer.index_cache.prefix]
-        q = self._allocate_query(qkv)
+        # FlashInfer autotunes the GEMMs its dummy runs call: take the unfused
+        # path there so qkv_proj is tuned for the M < 512 fallback.
+        if isinstance(hidden_states, QuantizedActivation):
+            num_tokens = hidden_states.orig_shape[0]
+            dtype, device = hidden_states.orig_dtype, hidden_states.data.device
+        else:
+            num_tokens = hidden_states.shape[0]
+            dtype, device = hidden_states.dtype, hidden_states.device
+        fused = (
+            self.use_qkv_fused_epilogue
+            and num_tokens >= _QKV_FUSED_EPILOGUE_MIN_TOKENS
+            and not is_flashinfer_autotuning()
+        )
+        if not fused:
+            # Single fused projection emitting [q | k | v | index_q | index_k].
+            qkv, _ = self.qkv_proj(hidden_states)
+        q = self._allocate_query(num_tokens, dtype, device)
         q_is_fp8 = q.dtype == torch.float8_e4m3fn
         # index_q is e4m3 for the fp8 and nvfp4 index caches, else bf16; the
         # fused kernel emits fp8 directly when this buffer is e4m3.
-        index_q = qkv.new_empty(
+        index_q = torch.empty(
             (num_tokens, self.index_q_size),
             dtype=self.indexer.index_cache.query_dtype,
+            device=device,
         )
-        ops.fused_minimax_m3_qknorm_rope_kv_insert(
-            qkv,
-            self.q_norm.weight,
-            self.k_norm.weight,
-            cos_sin_cache,
-            positions,
-            self.num_heads,
-            self.num_kv_heads,
-            rotary_dim,
-            eps,
-            self.index_q_norm.weight,
-            self.index_k_norm.weight,
-            self.num_idx_heads,
-            main_slot_mapping,
-            index_slot_mapping,
-            self.kv_cache,
-            self.indexer.index_cache.kv_cache,
-            self.kv_cache.size(2),  # paged-cache block size
-            None if q_is_fp8 else q,
-            index_q,
-            self.kv_cache_dtype,
-            q_fp8_out=q if q_is_fp8 else None,
-            q_fp8_scale=self._q_scale_float,
-            kv_k_scale=self._k_scale if self.use_nvfp4_kv else None,
-            kv_v_scale=self._v_scale if self.use_nvfp4_kv else None,
-        )
+        if fused:
+            self._qkv_proj_fused_epilogue(
+                hidden_states,
+                positions,
+                q,
+                index_q,
+                main_slot_mapping,
+                index_slot_mapping,
+            )
+        else:
+            # Horizontally-fused per-head Gemma QK-norm + partial NeoX RoPE on
+            # the main (q/k) and index (index_q/index_k) branches, all read
+            # straight out of qkv. k/v and index_k are rewritten in place and
+            # scatter-inserted into the caches; q and index_q are de-interleaved
+            # into the dedicated contiguous buffers above.
+            ops.fused_minimax_m3_qknorm_rope_kv_insert(
+                qkv,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                cos_sin_cache,
+                positions,
+                self.num_heads,
+                self.num_kv_heads,
+                rotary_dim,
+                eps,
+                self.index_q_norm.weight,
+                self.index_k_norm.weight,
+                self.num_idx_heads,
+                main_slot_mapping,
+                index_slot_mapping,
+                self.kv_cache,
+                self.indexer.index_cache.kv_cache,
+                self.kv_cache.size(2),  # paged-cache block size
+                None if q_is_fp8 else q,
+                index_q,
+                self.kv_cache_dtype,
+                q_fp8_out=q if q_is_fp8 else None,
+                q_fp8_scale=self._q_scale_float,
+                kv_k_scale=self._k_scale if self.use_nvfp4_kv else None,
+                kv_v_scale=self._v_scale if self.use_nvfp4_kv else None,
+            )
 
-        output = qkv.new_empty((num_tokens, self.q_size))
+        output = torch.empty((num_tokens, self.q_size), dtype=dtype, device=device)
         attn_output = self._run_attention(q, index_q, output)
         output, _ = self.o_proj(attn_output)
         return output
