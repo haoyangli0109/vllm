@@ -8,7 +8,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from vllm import PoolingParams, SamplingParams, envs
+from vllm import PoolingParams, SamplingParams
 from vllm.logger import init_logger
 from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
 from vllm.utils.math_utils import cdiv
@@ -27,7 +27,6 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.request import Request
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
-from vllm.v1.worker.gpu.spec_decode.rejection_sampler import radix_topp_reachable
 
 logger = init_logger(__name__)
 
@@ -246,16 +245,6 @@ def warmup_kernels(
             _warmup_kernels(
                 model_runner, worker_execute_model, worker_sample_tokens, greedy=True
             )
-            if envs.VLLM_SPEC_DECODE_RADIX_TOPP and radix_topp_reachable(
-                model_runner.vllm_config, model_runner.decode_query_len
-            ):
-                # Compile the radix2 top-p verification kernels now, not mid-traffic.
-                _warmup_kernels(
-                    model_runner,
-                    worker_execute_model,
-                    worker_sample_tokens,
-                    topp_only=True,
-                )
     finally:
         model_runner.adaptive_verification = adaptive_verification
         if adaptive_sampling:
@@ -268,7 +257,6 @@ def _warmup_kernels(
     worker_execute_model: Callable[[SchedulerOutput], Any],
     worker_sample_tokens: Callable[[GrammarOutput | None], Any],
     greedy: bool = False,
-    topp_only: bool = False,
 ) -> None:
     if model_runner.vllm_config.is_mm_encoder_only:
         return
@@ -344,8 +332,6 @@ def _warmup_kernels(
         sampling_params = (
             SamplingParams(temperature=0)
             if greedy
-            else SamplingParams(temperature=0.9, top_p=0.9)
-            if topp_only
             else SamplingParams.for_sampler_warmup()
         )
         pooling_params = None

@@ -307,7 +307,6 @@ if TYPE_CHECKING:
     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
     VLLM_USE_V2_MODEL_RUNNER: bool | None = None
-    VLLM_SPEC_DECODE_RADIX_TOPP: bool = False
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
@@ -2135,12 +2134,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_USE_V2_MODEL_RUNNER": lambda: maybe_convert_bool(
         os.getenv("VLLM_USE_V2_MODEL_RUNNER", None)
     ),
-    # V2 model runner, speculative decoding: exact top-p thresholds over the bf16
-    # logits, applied on load by the rejection kernels, for verification chunks
-    # above 64 rows of temperature/top-p requests. Off: an fp32 copy as in sampling.
-    "VLLM_SPEC_DECODE_RADIX_TOPP": lambda: bool(
-        int(os.getenv("VLLM_SPEC_DECODE_RADIX_TOPP", "0"))
-    ),
     # Log model inspection after loading.
     # If enabled, logs a transformers-style hierarchical view of the model
     # with quantization methods and attention backends.
@@ -2369,8 +2362,6 @@ def compile_factors() -> dict[str, object]:
         "VLLM_SERVER_DEV_MODE",
         "VLLM_DP_MASTER_IP",
         "VLLM_DP_MASTER_PORT",
-        # Sampling only; does not affect compiled graphs.
-        "VLLM_SPEC_DECODE_RADIX_TOPP",
         "VLLM_NIXL_SIDE_CHANNEL_HOST",
         "VLLM_RANDOMIZE_DP_DUMMY_INPUTS",
         "VLLM_MODEL_REDIRECT_PATH",
