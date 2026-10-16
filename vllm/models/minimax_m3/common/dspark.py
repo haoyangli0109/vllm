@@ -40,6 +40,12 @@ from vllm.models.minimax_m3.common.ops.dspark_context_kv import (
 )
 from vllm.platforms import current_platform
 from vllm.transformers_utils.configs.minimax_m3 import MiniMaxM3TextConfig
+from vllm.utils.torch_utils import (
+    LayerNameType,
+    _encode_layer_name,
+    _resolve_layer_name,
+    direct_register_custom_op,
+)
 
 _CHECKPOINT_PREFIX = "language_model.model.dspark."
 
@@ -71,6 +77,71 @@ def _gemma_rms_norm(hidden_size: int, eps: float) -> nn.Module:
     else:
         from vllm.models.minimax_m3.nvidia.model import MiniMAXGemmaRMSNorm
     return MiniMAXGemmaRMSNorm(hidden_size, eps=eps)
+
+
+def dspark_qknorm_rope_kv_insert(
+    qkv: torch.Tensor,
+    q_norm_weight: torch.Tensor,
+    k_norm_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    num_heads: int,
+    num_kv_heads: int,
+    rotary_dim: int,
+    eps: float,
+    q_fp8_out: torch.Tensor | None,
+    layer_name: LayerNameType,
+) -> None:
+    """The fused QK-norm/RoPE on ``qkv``, also storing the draft tokens' k/v.
+
+    A custom op so the slot mapping is read when it runs: read in the compiled
+    forward, it is fixed at trace time, when the draft layers have none.
+    """
+    _, layer, kv_cache, slot_mapping = get_attention_context(
+        _resolve_layer_name(layer_name)
+    )
+    insert = slot_mapping is not None
+    ops.fused_minimax_m3_qknorm_rope_kv_insert(
+        qkv,
+        q_norm_weight,
+        k_norm_weight,
+        cos_sin_cache,
+        positions,
+        num_heads,
+        num_kv_heads,
+        rotary_dim,
+        eps,
+        slot_mapping=slot_mapping,
+        kv_cache=kv_cache if insert else None,
+        block_size=kv_cache.size(2) if insert else 0,
+        kv_cache_dtype="fp8" if insert and kv_cache.dtype == torch.uint8 else "auto",
+        q_fp8_out=q_fp8_out,
+        q_fp8_scale=layer._q_scale_float,
+    )
+
+
+def dspark_qknorm_rope_kv_insert_fake(
+    qkv: torch.Tensor,
+    q_norm_weight: torch.Tensor,
+    k_norm_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    num_heads: int,
+    num_kv_heads: int,
+    rotary_dim: int,
+    eps: float,
+    q_fp8_out: torch.Tensor | None,
+    layer_name: LayerNameType,
+) -> None:
+    return
+
+
+direct_register_custom_op(
+    op_name="minimax_m3_dspark_qknorm_rope_kv_insert",
+    op_func=dspark_qknorm_rope_kv_insert,
+    mutates_args=["qkv", "q_fp8_out"],
+    fake_impl=dspark_qknorm_rope_kv_insert_fake,
+)
 
 
 class MiniMaxM3DSparkAttention(DFlashQwen3Attention):
@@ -138,9 +209,7 @@ class MiniMaxM3DSparkAttention(DFlashQwen3Attention):
             else None
         )
         # Also stores the draft tokens' k/v, so the attention layer gets q alone.
-        _, layer, kv_cache, slot_mapping = get_attention_context(self.attn.layer_name)
-        insert = slot_mapping is not None
-        ops.fused_minimax_m3_qknorm_rope_kv_insert(
+        torch.ops.vllm.minimax_m3_dspark_qknorm_rope_kv_insert(
             qkv,
             self.q_norm.weight,
             self.k_norm.weight,
@@ -150,12 +219,8 @@ class MiniMaxM3DSparkAttention(DFlashQwen3Attention):
             self.num_kv_heads,
             self.rotary_emb.rotary_dim,
             self.q_norm.variance_epsilon,
-            slot_mapping=slot_mapping,
-            kv_cache=kv_cache if insert else None,
-            block_size=kv_cache.size(2) if insert else 0,
-            kv_cache_dtype="fp8" if kv_cache.dtype == torch.uint8 else "auto",
-            q_fp8_out=q_fp8,
-            q_fp8_scale=layer._q_scale_float,
+            q_fp8,
+            _encode_layer_name(self.attn.layer_name),
         )
         q = qkv[:, : self.q_size] if q_fp8 is None else q_fp8
         # output_dtype must be stated: it otherwise follows the query, which
