@@ -72,14 +72,7 @@ def tl_rand32(seed, offset, includes_zero: tl.constexpr):
 
 @triton.jit
 def spec_step_seed(seed, step):
-    """Seed for the draws of draft step `step` in a speculative block.
-
-    Block verification observes every draft and acceptance draw in a block, and
-    the next block re-proposes the positions past the accepted prefix at earlier
-    steps. Keying those draws by (position, step) rather than by position alone
-    keeps a re-proposal from reusing a draw that verification already observed.
-    Step 0 keeps the request seed.
-    """
+    """Mix a speculative step into the high bits of a request seed."""
     return seed ^ (tl.cast(step, tl.int64) << 32)
 
 
@@ -248,7 +241,6 @@ def gumbel_block_argmax(
     temp = tl.load(temp_ptr + req_state_idx, mask=is_valid_req, other=0.0).to(
         tl.float32
     )
-    seed = tl.load(seeds_ptr + req_state_idx, mask=is_valid_req, other=0)
     if logits_cache_ptr is not None:
         # Store the logits *before* temperature. Dividing first would produce a
         # value that is generally not representable in the cache's dtype, forcing
@@ -275,11 +267,11 @@ def gumbel_block_argmax(
             cached_logits,
             mask=mask & is_valid_req,
         )
-        if IS_DRAFTING:
-            # The cache column is the draft step.
-            seed = spec_step_seed(seed, col)
 
+    seed = tl.load(seeds_ptr + req_state_idx, mask=is_valid_req, other=0)
     pos = tl.load(pos_ptr + token_idx)
+    if logits_cache_ptr is not None:
+        seed = spec_step_seed(seed, col)
     return gumbel_noised_argmax(
         logits,
         block,
