@@ -345,10 +345,35 @@ class MiniMaxM3MLP(nn.Module):
             alpha=config.swiglu_alpha,
             beta=config.swiglu_beta,
         )
+        from vllm.models.minimax_m3.nvidia.ops import dense_gemm1_mxfp8
+
+        # At or below the shared-experts stream threshold the persistent kernel
+        # would contend with the routed experts on the aux stream.
+        self.fused_gemm1_min_tokens: int | None = None
+        if dense_gemm1_mxfp8.can_fuse_gemm1(
+            self.gate_up_proj, self.down_proj, self.act_fn
+        ):
+            self.fused_gemm1_min_tokens = max(
+                dense_gemm1_mxfp8.MIN_TOKENS,
+                envs.VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD,
+            )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
+        num_tokens = x.shape[0]
+        # Run unfused under FlashInfer autotuning so gate_up_proj is tuned too
+        if (
+            self.fused_gemm1_min_tokens is not None
+            and num_tokens > self.fused_gemm1_min_tokens
+            and not is_flashinfer_autotuning()
+        ):
+            from vllm.models.minimax_m3.nvidia.ops.dense_gemm1_mxfp8 import (
+                fused_gemm1,
+            )
+
+            x = fused_gemm1(x, self.gate_up_proj, self.act_fn)
+        else:
+            gate_up, _ = self.gate_up_proj(x)
+            x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
 
