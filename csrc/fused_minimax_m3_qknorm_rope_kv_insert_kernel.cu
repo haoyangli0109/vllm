@@ -48,6 +48,7 @@
  * ``qkv`` tensor.  Caches (bf16) are scatter-written by slot.
  */
 
+#include <algorithm>
 #include <cmath>
 #include <cuda_runtime.h>
 #include <type_traits>
@@ -272,11 +273,43 @@ __device__ __forceinline__ void storeElemsFp8(
 
 // Match scaled_fp8_quant(q_out): materialize q in scalar_t before applying the
 // inverse dequantization scale and converting it to E4M3.
+#ifndef USE_ROCM
+// storeScaledQElemsFp8 with inv_scale = 1, from the packed model-dtype values:
+// E4M3 of a scalar_t equals E4M3 of its float, the max takes NaN and values
+// below -448 to -448 as storeElemsFp8's fmaxf does, and the cvt saturates the
+// top at 448.
+template <typename scalar_t>
+__device__ __forceinline__ void storeUnitScaleQElemsFp8(
+    uint8_t* __restrict__ dst, float const (&elems)[kElemsPerLane]) {
+  using Converter = vllm::_typeConvert<scalar_t>;
+  __nv_fp8x2_storage_t out2[kElemsPerLane / 2];
+  #pragma unroll
+  for (int i = 0; i < kElemsPerLane / 2; i++) {
+    auto const v =
+        Converter::convert(make_float2(elems[2 * i], elems[2 * i + 1]));
+    if constexpr (std::is_same_v<scalar_t, c10::BFloat16>) {
+      out2[i] = __nv_cvt_bfloat16raw2_to_fp8x2(
+          __hmax2(v, __float2bfloat162_rn(-448.0f)), __NV_SATFINITE, __NV_E4M3);
+    } else {
+      out2[i] = __nv_cvt_halfraw2_to_fp8x2(
+          __hmax2(v, __float2half2_rn(-448.0f)), __NV_SATFINITE, __NV_E4M3);
+    }
+  }
+  *reinterpret_cast<uint32_t*>(dst) = *reinterpret_cast<uint32_t const*>(out2);
+}
+#endif
+
 template <typename scalar_t>
 __device__ __forceinline__ void storeScaledQElemsFp8(
     uint8_t* __restrict__ dst, float const (&elems)[kElemsPerLane],
     float const inv_scale) {
   using Converter = vllm::_typeConvert<scalar_t>;
+#ifndef USE_ROCM
+  if (inv_scale == 1.0f) {
+    storeUnitScaleQElemsFp8<scalar_t>(dst, elems);
+    return;
+  }
+#endif
   float scaled[kElemsPerLane];
 #pragma unroll
   for (int i = 0; i < kElemsPerLane; i++) {
@@ -425,27 +458,14 @@ __device__ __forceinline__ uint16_t clearNegZeroNibbles(uint16_t packed) {
   return packed & (((packed & 0x7777u) + 0x7777u) | 0x7777u);
 }
 
-// Quantize one K or V head row of one token into its NVFP4 page, where
-// ``scale`` is the dequantization (global) scale. Every lane of the warp must
-// call this (the scale-group reductions shuffle).
+// The E2M1 codes (low nibble first) of four values x, already rounded to the
+// model dtype, of a 16-value group with absolute maximum group_max, and the
+// group's E4M3 scale in ``sf_byte``, where ``scale`` is the dequantization
+// (global) scale.
 template <typename scalar_t>
-__device__ __forceinline__ void storeNvfp4CacheElems(
-    uint8_t* __restrict__ page, int const kv, int const head, int const token,
-    int const block_size, int const laneId, float const (&elems)[kElemsPerLane],
-    float const scale) {
-  // Quantize the model-dtype value that the unfused path reads back from qkv.
-  using Converter = vllm::_typeConvert<scalar_t>;
-  float x[kElemsPerLane];
-  float group_max = 0.0f;
-  #pragma unroll
-  for (int i = 0; i < kElemsPerLane; i++) {
-    x[i] = static_cast<float>(Converter::convert(elems[i]));
-    group_max = fmaxf(group_max, fabsf(x[i]));
-  }
-  group_max = fmaxf(group_max, __shfl_xor_sync(FINAL_MASK, group_max, 1, 32));
-  group_max = fmaxf(group_max, __shfl_xor_sync(FINAL_MASK, group_max, 2, 32));
-
-  uint8_t sf_byte;
+__device__ __forceinline__ uint16_t
+nvfp4EncodeElems(float const (&x)[kElemsPerLane], float const group_max,
+                 float const scale, uint8_t& sf_byte) {
   float sf_rcp;
   float q[kElemsPerLane];  // (x / scale) / sf_value, E2M1-encoded below
   if (scale == 1.0f) {
@@ -517,8 +537,49 @@ __device__ __forceinline__ void storeNvfp4CacheElems(
   for (int i = 0; i < kElemsPerLane; i++) codes |= e2m1Code(q[i]) << (4 * i);
   packed = static_cast<uint16_t>(codes);
   #endif
-  packed = clearNegZeroNibbles(packed);
+  return clearNegZeroNibbles(packed);
+}
 
+// Offset, within a K (kv 0) or V (kv 1) head's scale block, of the E4M3 scale
+// of a token's 16-value group: linear for K, the SM100 trtllm-gen 4x4
+// token-quad swizzle for V.
+__device__ __forceinline__ int nvfp4ScaleOffset(int const kv, int const token,
+                                                int const group) {
+  if (kv == 0) return token * kNvfp4ScaleBytes + group;
+  constexpr int kGroupsPerQuad = kNvfp4ScaleBytes / 4;
+  int const swizzled_t = (token / 4) * 4 + group / kGroupsPerQuad;
+  int const swizzled_s = (group % kGroupsPerQuad) * 4 + token % 4;
+  return swizzled_t * kNvfp4ScaleBytes + swizzled_s;
+}
+
+// The E2M1 codes of this lane's four values of a K or V head row, rounded to
+// the model dtype, and in ``sf_byte`` its 16-value group's E4M3 scale, where
+// ``scale`` is the dequantization (global) scale. Every lane of the warp must
+// call this (the scale-group reductions shuffle).
+template <typename scalar_t>
+__device__ __forceinline__ uint16_t nvfp4QuantizeElems(
+    float const (&elems)[kElemsPerLane], float const scale, uint8_t& sf_byte) {
+  // Quantize the model-dtype value that the unfused path reads back from qkv.
+  using Converter = vllm::_typeConvert<scalar_t>;
+  float x[kElemsPerLane];
+  float group_max = 0.0f;
+  #pragma unroll
+  for (int i = 0; i < kElemsPerLane; i++) {
+    x[i] = static_cast<float>(Converter::convert(elems[i]));
+    group_max = fmaxf(group_max, fabsf(x[i]));
+  }
+  group_max = fmaxf(group_max, __shfl_xor_sync(FINAL_MASK, group_max, 1, 32));
+  group_max = fmaxf(group_max, __shfl_xor_sync(FINAL_MASK, group_max, 2, 32));
+
+  return nvfp4EncodeElems<scalar_t>(x, group_max, scale, sf_byte);
+}
+
+// Store the codes and scale from nvfp4QuantizeElems of lane laneId's four
+// values of a token's K (kv 0) or V (kv 1) head row.
+__device__ __forceinline__ void nvfp4StoreElems(
+    uint8_t* __restrict__ page, int const kv, int const head, int const token,
+    int const block_size, int const laneId, uint16_t const packed,
+    uint8_t const sf_byte) {
   uint8_t* const slot = page + static_cast<int64_t>(2 * head + kv) *
                                    block_size *
                                    (kNvfp4DataBytes + kNvfp4ScaleBytes);
@@ -527,18 +588,56 @@ __device__ __forceinline__ void storeNvfp4CacheElems(
   *reinterpret_cast<uint16_t*>(data) = packed;
 
   if (laneId % kNvfp4LanesPerGroup == 0) {
-    int const group = laneId / kNvfp4LanesPerGroup;
-    int offset;
-    if (kv == 0) {
-      offset = token * kNvfp4ScaleBytes + group;
-    } else {
-      constexpr int kGroupsPerQuad = kNvfp4ScaleBytes / 4;
-      int const swizzled_t = (token / 4) * 4 + group / kGroupsPerQuad;
-      int const swizzled_s = (group % kGroupsPerQuad) * 4 + token % 4;
-      offset = swizzled_t * kNvfp4ScaleBytes + swizzled_s;
-    }
-    slot[block_size * kNvfp4DataBytes + offset] = sf_byte;
+    slot[block_size * kNvfp4DataBytes +
+         nvfp4ScaleOffset(kv, token, laneId / kNvfp4LanesPerGroup)] = sf_byte;
   }
+}
+
+// nvfp4QuantizeElems for one lane holding a whole 16-value group x (already
+// rounded to the model dtype): the group max is order-independent, so this is
+// the same codes and scale without the shuffles. Low nibble first.
+template <typename scalar_t>
+__device__ __forceinline__ uint2 nvfp4QuantizeGroup(float const (&x)[16],
+                                                    float const scale,
+                                                    uint8_t& sf_byte) {
+  float group_max = 0.0f;
+  #pragma unroll
+  for (int i = 0; i < 16; i++) group_max = fmaxf(group_max, fabsf(x[i]));
+  uint32_t codes[4];
+  #pragma unroll
+  for (int k = 0; k < 4; k++) {
+    float const xk[kElemsPerLane] = {x[4 * k], x[4 * k + 1], x[4 * k + 2],
+                                     x[4 * k + 3]};
+    codes[k] = nvfp4EncodeElems<scalar_t>(xk, group_max, scale, sf_byte);
+  }
+  return make_uint2(codes[0] | codes[1] << 16, codes[2] | codes[3] << 16);
+}
+
+// Store group ``group`` (its 8 code bytes and its scale) of a token's K
+// (kv 0) or V (kv 1) head row into its NVFP4 page.
+__device__ __forceinline__ void nvfp4StoreGroup(
+    uint8_t* __restrict__ page, int const kv, int const head, int const token,
+    int const block_size, int const group, uint2 const codes,
+    uint8_t const sf_byte) {
+  uint8_t* const slot = page + static_cast<int64_t>(2 * head + kv) *
+                                   block_size *
+                                   (kNvfp4DataBytes + kNvfp4ScaleBytes);
+  *reinterpret_cast<uint2*>(slot + token * kNvfp4DataBytes + 8 * group) = codes;
+  slot[block_size * kNvfp4DataBytes + nvfp4ScaleOffset(kv, token, group)] =
+      sf_byte;
+}
+
+// Quantize one K or V head row of one token into its NVFP4 page, where
+// ``scale`` is the dequantization (global) scale. Every lane of the warp must
+// call this (the scale-group reductions shuffle).
+template <typename scalar_t>
+__device__ __forceinline__ void storeNvfp4CacheElems(
+    uint8_t* __restrict__ page, int const kv, int const head, int const token,
+    int const block_size, int const laneId, float const (&elems)[kElemsPerLane],
+    float const scale) {
+  uint8_t sf_byte;
+  uint16_t const packed = nvfp4QuantizeElems<scalar_t>(elems, scale, sf_byte);
+  nvfp4StoreElems(page, kv, head, token, block_size, laneId, packed, sf_byte);
 }
 #endif  // USE_ROCM
 
@@ -821,6 +920,754 @@ __global__ void fusedMiniMaxM3QNormRopeKVInsertKernel(
 #endif
 }
 
+#ifndef USE_ROCM
+// ────────────────────────────────────────────────────────────────────────────
+// Persistent row-group kernel
+// ────────────────────────────────────────────────────────────────────────────
+// Writes the same bytes as the kernel above, for every instantiation of it,
+// when rotary_dim == 64. A token's work is a group of warps with fixed roles:
+// the q heads kQHeads (4 or 8) per warp, then K, V and index_q four heads per
+// warp, then index_k. A branch of fewer than four heads, and index_k, takes
+// one warp per head in the layout of the kernel above (lane l holds dims
+// 4l .. 4l + 3); the others run four-row steps, where lane (g, v) holds dims
+// 32c + 4v .. 32c + 4v + 3 (c = 0..3) of row g, the dims lane 8c + v holds
+// above, so the stores call the same helpers with that lane id. A CTA runs
+// some or all warps of the warp groups of tokens x, x + gridDim.x, ..., and
+// each warp copies the qkv rows and cos/sin row of its next tokens into a
+// kStages-deep shared-memory ring with cp.async.
+namespace rg {
+
+constexpr int kRows = 4;
+constexpr int kChunks = 4;
+constexpr int kRotaryDim = 64;
+constexpr int kStages = 3;  // ring depth: two tokens in flight per warp
+// A ring row: 256 B padded to 320 B, so that rows 1 apart start 16 banks apart
+// and a 4-row step's 8-byte loads are conflict-free.
+constexpr int kRowPitch = kHeadDim * 2 + 64;
+constexpr int kCosSinBytes = kRotaryDim * 2;
+enum Role : int { kQ = 0, kK, kV, kIQ, kIK };
+
+// SM100's packed FP32 instructions where they exist; the same RN results.
+__device__ __forceinline__ float2 mul2(float2 const a, float2 const b) {
+  #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+  return __fmul2_rn(a, b);
+  #else
+  return make_float2(__fmul_rn(a.x, b.x), __fmul_rn(a.y, b.y));
+  #endif
+}
+
+__device__ __forceinline__ float2 fma2(float2 const a, float2 const b,
+                                       float2 const c) {
+  #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+  return __ffma2_rn(a, b, c);
+  #else
+  return make_float2(__fmaf_rn(a.x, b.x, c.x), __fmaf_rn(a.y, b.y, c.y));
+  #endif
+}
+
+__device__ __forceinline__ float2 add2(float2 const a, float2 const b) {
+  #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+  return __fadd2_rn(a, b);
+  #else
+  return make_float2(__fadd_rn(a.x, b.x), __fadd_rn(a.y, b.y));
+  #endif
+}
+
+// A head row as one lane holds it, paired for packed FP32 math:
+// x[k][i] = element i of chunks 2k and 2k + 1.
+using Row = float2[2][4];
+
+template <typename scalar_t>
+__device__ __forceinline__ void loadRow(uint8_t const* row, int const v,
+                                        Row& x) {
+  float e[kChunks][kElemsPerLane];
+  #pragma unroll
+  for (int c = 0; c < kChunks; c++) {
+    loadElems<scalar_t>(reinterpret_cast<scalar_t const*>(row + 64 * c + 8 * v),
+                        e[c]);
+  }
+  #pragma unroll
+  for (int k = 0; k < 2; k++) {
+  #pragma unroll
+    for (int i = 0; i < kElemsPerLane; i++) {
+      x[k][i] = make_float2(e[2 * k][i], e[2 * k + 1][i]);
+    }
+  }
+}
+
+__device__ __forceinline__ void chunkElems(Row const& x, int const c,
+                                           float (&e)[kElemsPerLane]) {
+  #pragma unroll
+  for (int i = 0; i < kElemsPerLane; i++) {
+    e[i] = c % 2 ? x[c / 2][i].y : x[c / 2][i].x;
+  }
+}
+
+// normAndRope (Gemma RMSNorm, then NeoX RoPE on dims [0, 64)) with its
+// rounding as compiled: an FFMA sum of squares per lane of the one-warp-per-row
+// layout (one chunk here), the xor-16/8/4/2/1 tree (16 pairs chunks c and
+// c ^ 2, 8 pairs c and c ^ 1), FFMA(sum, 1/128, eps), rsqrtf, x * rms * w, and
+// x * cos -/+ RN(partner * sin) as one FFMA.
+__device__ __forceinline__ void normRope(Row& x, Row const& w1, float const eps,
+                                         float const (&cos4)[4],
+                                         float const (&sin4)[4]) {
+  float2 sq[2];
+  #pragma unroll
+  for (int k = 0; k < 2; k++) {
+    sq[k] = mul2(x[k][0], x[k][0]);  // = FFMA(x, x, 0)
+  #pragma unroll
+    for (int i = 1; i < 4; i++) sq[k] = fma2(x[k][i], x[k][i], sq[k]);
+  }
+  float2 const xor16 = add2(sq[0], sq[1]);
+  float sum = __fadd_rn(xor16.x, xor16.y);
+  sum = __fadd_rn(sum, __shfl_xor_sync(FINAL_MASK, sum, 4, 32));
+  sum = __fadd_rn(sum, __shfl_xor_sync(FINAL_MASK, sum, 2, 32));
+  sum = __fadd_rn(sum, __shfl_xor_sync(FINAL_MASK, sum, 1, 32));
+  float const rms_rcp =
+      rsqrtf(__fmaf_rn(sum, 1.0f / static_cast<float>(kHeadDim), eps));
+  float2 const r2 = make_float2(rms_rcp, rms_rcp);
+  #pragma unroll
+  for (int k = 0; k < 2; k++) {
+  #pragma unroll
+    for (int i = 0; i < 4; i++) x[k][i] = mul2(mul2(x[k][i], r2), w1[k][i]);
+  }
+  // x[0][i] = (x1, x2): dims 4v + i and 32 + 4v + i.
+  #pragma unroll
+  for (int i = 0; i < 4; i++) {
+    float2 const x_sin = mul2(x[0][i], make_float2(sin4[i], sin4[i]));
+    x[0][i] = make_float2(__fmaf_rn(x[0][i].x, cos4[i], -x_sin.y),
+                          __fmaf_rn(x[0][i].y, cos4[i], x_sin.x));
+  }
+}
+
+__device__ __forceinline__ void cpAsync16(uint32_t const dst, void const* src) {
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst),
+               "l"(src)
+               : "memory");
+}
+
+__device__ __forceinline__ void cpAsyncCommit() {
+  asm volatile("cp.async.commit_group;\n" ::: "memory");
+}
+
+template <int kPending>
+__device__ __forceinline__ void cpAsyncWait() {
+  asm volatile("cp.async.wait_group %0;\n" ::"n"(kPending) : "memory");
+}
+
+// Warp roles of a token's warp group: the q heads kQHeads at a time, then K,
+// V and index_q four heads at a time, then index_k.
+// A branch of fewer than kRows heads (and index_k) takes one warp per head in
+// the layout of the kernel above instead of a part-empty four-row step.
+struct Roles {
+  int nq, nkv, niq;
+  bool kv_one, iq_one;  // one warp per head
+  int q_warps, kv_warps, v_warps, iq_warps, ik_warps;
+  int warps;  // one token's warp group
+
+  __host__ __device__ Roles(int const q_heads, int const nq_, int const nkv_,
+                            int const niq_, bool const insert_kv,
+                            bool const process_index)
+      : nq(nq_), nkv(nkv_), niq(niq_) {
+    kv_one = nkv < kRows;
+    iq_one = niq < kRows;
+    q_warps = (nq + q_heads - 1) / q_heads;
+    kv_warps = kv_one ? nkv : (nkv + kRows - 1) / kRows;
+    v_warps = insert_kv ? kv_warps : 0;
+    iq_warps = process_index ? (iq_one ? niq : (niq + kRows - 1) / kRows) : 0;
+    ik_warps = process_index ? 1 : 0;
+    warps = q_warps + kv_warps + v_warps + iq_warps + ik_warps;
+  }
+
+  // Shared-memory offset of warp w's ring: the q warps' rings, then the
+  // others'.
+  __host__ __device__ int ringOffset(int const w, int const q_ring,
+                                     int const side_ring) const {
+    return min(w, q_warps) * q_ring + max(w - q_warps, 0) * side_ring;
+  }
+};
+
+// CTA size limit, for 80 registers per thread.
+constexpr int kMaxWarps = 24;
+
+template <int kQHeads>
+constexpr int stageBytes() {
+  return kQHeads * kRowPitch + kCosSinBytes;
+}
+
+// What a warp writes besides the caches, fixed per launch so that the stores
+// of the other modes are not compiled into the loop: q (kQFp8Unit: only
+// q_fp8_out, unit scale; kQFp8: only q_fp8_out; kQAny: decided per store),
+// index_q (kIQOut: index_q_out; kIQInPlace: back into qkv; kNone), and the
+// in-place k / index_k rewrite (kInPlace or kNone).
+enum Out : int {
+  kNone = 0,
+  kInPlace,
+  kQFp8Unit,
+  kQFp8,
+  kQAny,
+  kIQOut,
+  kIQInPlace
+};
+
+// One warp's loop over its CTA's tokens: rows [head0, head0 + nrows) of one
+// branch, kSteps four-row steps per token.
+template <int kRole, int kSteps, int kOut, typename scalar_t, typename cache_t,
+          Fp8KVCacheDataType kv_dt, bool kNvfp4, typename out_idx_t,
+          bool kHasIndex, bool kInsertKV, bool kFp8Idx, bool kNvfp4Idx,
+          bool kOneRow = false>
+__device__ __forceinline__ void runWarp(
+    int const head0, int const nrows, int const qkv_head0, uint8_t* const ring,
+    int const stage_bytes, scalar_t* __restrict__ qkv,
+    scalar_t* __restrict__ q_out, uint8_t* __restrict__ q_fp8_out,
+    out_idx_t* __restrict__ index_q_out, scalar_t const* __restrict__ norm_w,
+    scalar_t const* __restrict__ cos_sin_cache,
+    int64_t const* __restrict__ positions,
+    int64_t const* __restrict__ slot_mapping, cache_t* __restrict__ kv_cache,
+    out_idx_t* __restrict__ index_cache, float const eps,
+    float const q_fp8_inv_scale, int const num_tokens, int const nq,
+    int const niq, int const qkv_row, int const block_size,
+    int64_t const kv_s_block, int64_t const kv_s_head, int64_t const kv_s_token,
+    int64_t const kv_s_dim, int64_t const idx_s_block, float const kv_scale,
+    bool const write_qkv) {
+  constexpr bool kNorm = kRole != kV;
+  constexpr bool kSlots =
+      kInsertKV && (kRole == kK || kRole == kV || kRole == kIK);
+  // kOneRow: a single row in the layout of the kernel above (lane l holds
+  // dims 4l .. 4l + 3), for branches of one head.
+  constexpr int kStepRows = kOneRow ? 1 : kRows;
+  constexpr int kLaneChunks = kOneRow ? 1 : kChunks;
+  int const lane = threadIdx.x % 32;
+  int const g = kOneRow ? 0 : lane / 8;
+  int const v = kOneRow ? lane : lane % 8;
+  constexpr int kCopies = (kSteps * kStepRows * 16 + 31) / 32;
+  uint32_t const ring_smem =
+      static_cast<uint32_t>(__cvta_generic_to_shared(ring));
+
+  // Not produced by the predecessor: loaded before the PDL wait, used after.
+  uint2 w_raw[kChunks];
+  if constexpr (kNorm && !kOneRow) {
+  #pragma unroll
+    for (int c = 0; c < kChunks; c++) {
+      w_raw[c] = __ldg(reinterpret_cast<uint2 const*>(norm_w + 32 * c + 4 * v));
+    }
+  }
+
+  // PDL: qkv comes from the predecessor (the qkv GEMM).
+  #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+  cudaGridDependencySynchronize();
+  #endif
+
+  Row w1;
+  if constexpr (kNorm && !kOneRow) {
+    float e[kChunks][kElemsPerLane];
+  #pragma unroll
+    for (int c = 0; c < kChunks; c++) {
+      loadElems<scalar_t>(reinterpret_cast<scalar_t const*>(&w_raw[c]), e[c]);
+    }
+  #pragma unroll
+    for (int k = 0; k < 2; k++) {
+  #pragma unroll
+      for (int i = 0; i < kElemsPerLane; i++) {
+        w1[k][i] = make_float2(1.0f + e[2 * k][i], 1.0f + e[2 * k + 1][i]);
+      }
+    }
+  }
+
+  int const stride = gridDim.x;
+  int const t0 = blockIdx.x;
+  int const n = (num_tokens - t0 + stride - 1) / stride;
+  // Lane j holds the position (slot) of the token of iteration base + j.
+  auto fetch = [&](int64_t const* src, int const base, int64_t const fill) {
+    int64_t const t = t0 + static_cast<int64_t>(base + lane) * stride;
+    return t < num_tokens ? static_cast<int64_t>(__ldg(
+                                reinterpret_cast<long long const*>(src) + t))
+                          : fill;
+  };
+  int pos_base = 0, slot_base = 0;
+  int64_t pos_l = 0, slot_l = -1;
+  if constexpr (kNorm) pos_l = fetch(positions, 0, 0);
+  if constexpr (kSlots) slot_l = fetch(slot_mapping, 0, -1);
+
+  scalar_t const* const src0 =
+      qkv + static_cast<int64_t>(t0) * qkv_row + qkv_head0 * kHeadDim;
+  int64_t const src_step = static_cast<int64_t>(stride) * qkv_row;
+  auto issue_rows = [&](int const it) {
+    if (it >= n) return;
+    scalar_t const* const src = src0 + it * src_step;
+    uint32_t const stage = ring_smem + (it % kStages) * stage_bytes;
+  #pragma unroll
+    for (int k = 0; k < kCopies; k++) {
+      int const r = lane / 16 + 2 * k;
+      if (r < nrows && (!kOneRow || lane < 16)) {
+        cpAsync16(stage + r * kRowPitch + lane % 16 * 16,
+                  src + r * kHeadDim + lane % 16 * 8);
+      }
+    }
+  };
+  // The cos/sin row of iteration it, then the commit that closes its group.
+  auto issue_cos_sin = [&](int const it) {
+    if constexpr (kNorm) {
+      if (it < n) {
+        if (it - pos_base == 32) {
+          pos_base = it;
+          pos_l = fetch(positions, pos_base, 0);
+        }
+        int64_t const pos = __shfl_sync(
+            FINAL_MASK, static_cast<long long>(pos_l), it - pos_base, 32);
+        if (lane < kCosSinBytes / 16) {
+          cpAsync16(ring_smem + (it % kStages) * stage_bytes +
+                        kSteps * kStepRows * kRowPitch + lane * 16,
+                    cos_sin_cache + pos * kRotaryDim + lane * 8);
+        }
+      }
+    }
+    cpAsyncCommit();
+  };
+
+  // The prologue's rows do not wait for the positions.
+  #pragma unroll
+  for (int it = 0; it < kStages - 1; it++) issue_rows(it);
+  #pragma unroll
+  for (int it = 0; it < kStages - 1; it++) issue_cos_sin(it);
+
+  // This lane's dims 4v .. 4v + 3 (+ 32c) of row g of the first step, at the
+  // first token; each iteration advances them by stride tokens. Dims
+  // 32c + 4v of a row are lane 8c + v's dims in the kernel above.
+  scalar_t* in_place = qkv + static_cast<int64_t>(t0) * qkv_row +
+                       (qkv_head0 + g) * kHeadDim + 4 * v;
+  int const head_rows = kRole == kQ ? nq : kRole == kIQ ? niq : 0;
+  int64_t const out_lane =
+      (static_cast<int64_t>(t0) * head_rows + head0 + g) * kHeadDim + 4 * v;
+  int64_t const out_step = static_cast<int64_t>(stride) * head_rows * kHeadDim;
+  int64_t out = out_lane;
+
+  for (int it = 0; it < n; it++) {
+    issue_rows(it + kStages - 1);
+    issue_cos_sin(it + kStages - 1);
+    cpAsyncWait<kStages - 1>();
+    __syncwarp();
+    uint8_t const* const stage = ring + (it % kStages) * stage_bytes;
+    float cos4[4], sin4[4];
+    if constexpr (kNorm) {
+      scalar_t const* const cs = reinterpret_cast<scalar_t const*>(
+          stage + kSteps * kStepRows * kRowPitch);
+      if constexpr (!kOneRow) {
+        loadElems<scalar_t>(cs + 4 * v, cos4);
+        loadElems<scalar_t>(cs + kRotaryDim / 2 + 4 * v, sin4);
+      }
+    }
+    // Slot of the token: block and offset with one 32-bit division (the host
+    // checks that every slot fits).
+    int sm = -1;
+    uint32_t blk = 0, tok = 0;
+    if constexpr (kSlots) {
+      if (it - slot_base == 32) {
+        slot_base = it;
+        slot_l = fetch(slot_mapping, slot_base, -1);
+      }
+      sm = static_cast<int>(__shfl_sync(
+          FINAL_MASK, static_cast<long long>(slot_l), it - slot_base, 32));
+      blk = static_cast<uint32_t>(sm) / static_cast<uint32_t>(block_size);
+      tok = static_cast<uint32_t>(sm) - blk * block_size;
+    }
+
+  #pragma unroll
+    for (int step = 0; step < kSteps; step++) {
+      int const r = step * kStepRows + g;  // row of the warp
+      int const head = head0 + r;
+      bool const row_ok = r < nrows;
+      int const so = step * kStepRows * kHeadDim;  // step offset, elements
+      float e[kChunks][kElemsPerLane];
+      if constexpr (kOneRow) {
+        loadElems<scalar_t>(
+            reinterpret_cast<scalar_t const*>(stage + r * kRowPitch) + 4 * v,
+            e[0]);
+        if constexpr (kNorm) {
+          normAndRope<scalar_t>(
+              e[0], lane, eps, norm_w, /*do_rope=*/true, kRotaryDim,
+              reinterpret_cast<scalar_t const*>(stage + kSteps * kRowPitch),
+              /*apply_norm=*/true);
+        }
+      } else {
+        Row x;
+        loadRow<scalar_t>(stage + r * kRowPitch, v, x);
+        if constexpr (kNorm) normRope(x, w1, eps, cos4, sin4);
+  #pragma unroll
+        for (int c = 0; c < kChunks; c++) chunkElems(x, c, e[c]);
+      }
+      if constexpr (kRole == kQ) {
+        if (row_ok) {
+  #pragma unroll
+          for (int c = 0; c < kLaneChunks; c++) {
+            if constexpr (kOut == kQFp8Unit) {
+              storeUnitScaleQElemsFp8<scalar_t>(q_fp8_out + out + so + 32 * c,
+                                                e[c]);
+            } else if constexpr (kOut == kQFp8) {
+              storeScaledQElemsFp8<scalar_t>(q_fp8_out + out + so + 32 * c,
+                                             e[c], q_fp8_inv_scale);
+            } else {
+              if (q_out != nullptr) {
+                storeElems<scalar_t>(q_out + out + so + 32 * c, e[c]);
+              } else if (q_fp8_out == nullptr && write_qkv) {
+                storeElems<scalar_t>(in_place + so + 32 * c, e[c]);
+              }
+              if (q_fp8_out != nullptr) {
+                storeScaledQElemsFp8<scalar_t>(q_fp8_out + out + so + 32 * c,
+                                               e[c], q_fp8_inv_scale);
+              }
+            }
+          }
+        }
+      } else if constexpr (kRole == kIQ) {
+        if (row_ok) {
+  #pragma unroll
+          for (int c = 0; c < kLaneChunks; c++) {
+            if constexpr (kOut == kIQOut) {
+              if constexpr (kFp8Idx) {
+                storeIndexQElemsFp8<scalar_t>(
+                    reinterpret_cast<uint8_t*>(index_q_out + out + so + 32 * c),
+                    e[c]);
+              } else {
+                storeElems<scalar_t>(index_q_out + out + so + 32 * c, e[c]);
+              }
+            } else if constexpr (kOut == kIQInPlace) {
+              storeElems<scalar_t>(in_place + so + 32 * c, e[c]);
+            }
+          }
+        }
+      } else if constexpr (kRole == kK || kRole == kIK) {
+        if constexpr (kOut == kInPlace) {
+          if (row_ok) {
+  #pragma unroll
+            for (int c = 0; c < kLaneChunks; c++) {
+              storeElems<scalar_t>(in_place + so + 32 * c, e[c]);
+            }
+          }
+        }
+      }
+
+      if constexpr (kInsertKV && kRole == kIK) {
+        if constexpr (kNvfp4Idx) {
+          uint8_t* const page =
+              reinterpret_cast<uint8_t*>(index_cache) + blk * idx_s_block;
+  #pragma unroll
+          for (int c = 0; c < kLaneChunks; c++) {
+            uint8_t sf;
+            uint16_t const packed =
+                nvfp4QuantizeElems<scalar_t>(e[c], 1.0f, sf);
+            if (sm >= 0 && row_ok) {
+              nvfp4StoreElems(page, /*kv=*/0, /*head=*/0, tok, block_size,
+                              kOneRow ? lane : 8 * c + v, packed, sf);
+            }
+          }
+        } else if (sm >= 0 && row_ok) {
+          int64_t const off = static_cast<int64_t>(sm) * kHeadDim + 4 * v;
+  #pragma unroll
+          for (int c = 0; c < kLaneChunks; c++) {
+            if constexpr (kFp8Idx) {
+              storeElemsFp8(
+                  reinterpret_cast<uint8_t*>(index_cache) + off + 32 * c, e[c]);
+            } else {
+              storeElems<scalar_t>(index_cache + off + 32 * c, e[c]);
+            }
+          }
+        }
+      } else if constexpr (kInsertKV && (kRole == kK || kRole == kV)) {
+        constexpr int kv = kRole == kK ? 0 : 1;
+        if constexpr (kNvfp4 && !kOneRow) {
+          // One 16-value scale group per lane, regrouped through the ring
+          // row: lane (g, v) takes dims 16v .. 16v + 15 of row g.
+          uint8_t* const row =
+              ring + (it % kStages) * stage_bytes + r * kRowPitch;
+          if constexpr (kRole == kK) {
+            // The k in the model dtype, as the helper would quantize it (V
+            // rows already hold their model-dtype values).
+  #pragma unroll
+            for (int c = 0; c < kChunks; c++) {
+              storeElems<scalar_t>(
+                  reinterpret_cast<scalar_t*>(row + 64 * c + 8 * v), e[c]);
+            }
+          }
+          __syncwarp();
+          float x[16];
+  #pragma unroll
+          for (int k = 0; k < 4; k++) {
+            float q[kElemsPerLane];
+            loadElems<scalar_t>(
+                reinterpret_cast<scalar_t const*>(row + 32 * v + 8 * k), q);
+  #pragma unroll
+            for (int i = 0; i < kElemsPerLane; i++) x[4 * k + i] = q[i];
+          }
+          uint8_t sf;
+          uint2 const codes = nvfp4QuantizeGroup<scalar_t>(x, kv_scale, sf);
+          if (sm >= 0 && row_ok) {
+            nvfp4StoreGroup(
+                reinterpret_cast<uint8_t*>(kv_cache) + blk * kv_s_block, kv,
+                head, tok, block_size, v, codes, sf);
+          }
+        } else if constexpr (kNvfp4) {
+          uint8_t* const page =
+              reinterpret_cast<uint8_t*>(kv_cache) + blk * kv_s_block;
+  #pragma unroll
+          for (int c = 0; c < kLaneChunks; c++) {
+            uint8_t sf;
+            uint16_t const packed =
+                nvfp4QuantizeElems<scalar_t>(e[c], kv_scale, sf);
+            if (sm >= 0 && row_ok) {
+              nvfp4StoreElems(page, kv, head, tok, block_size,
+                              kOneRow ? lane : 8 * c + v, packed, sf);
+            }
+          }
+        } else if (sm >= 0 && row_ok) {
+          cache_t* const dst = kv_cache + blk * kv_s_block + head * kv_s_head +
+                               tok * kv_s_token +
+                               (kv * kHeadDim + 4 * v) * kv_s_dim;
+  #pragma unroll
+          for (int c = 0; c < kLaneChunks; c++) {
+            if constexpr (!kHasIndex) {
+              using Converter = vllm::_typeConvert<scalar_t>;
+  #pragma unroll
+              for (int i = 0; i < kElemsPerLane; i++) {
+                e[c][i] = Converter::convert(Converter::convert(e[c][i]));
+              }
+            }
+            storeCacheElems<scalar_t, cache_t, kv_dt>(dst + 32 * c * kv_s_dim,
+                                                      e[c]);
+          }
+        }
+      }
+    }
+    in_place += src_step;
+    out += out_step;
+    __syncwarp();
+  }
+}
+
+template <int kQHeads, typename scalar_t, typename cache_t,
+          Fp8KVCacheDataType kv_dt, bool kNvfp4, typename out_idx_t,
+          bool kHasIndex, bool kInsertKV, bool kProcessIndex, bool kFp8Idx,
+          bool kNvfp4Idx>
+__global__ void __launch_bounds__(kMaxWarps * 32) fusedMiniMaxM3RowGroupKernel(
+    scalar_t* __restrict__ qkv, scalar_t* __restrict__ q_out,
+    uint8_t* __restrict__ q_fp8_out, out_idx_t* __restrict__ index_q_out,
+    scalar_t const* __restrict__ q_norm_w,
+    scalar_t const* __restrict__ k_norm_w,
+    scalar_t const* __restrict__ iq_norm_w,
+    scalar_t const* __restrict__ ik_norm_w,
+    scalar_t const* __restrict__ cos_sin_cache,
+    int64_t const* __restrict__ positions,
+    int64_t const* __restrict__ slot_mapping,
+    int64_t const* __restrict__ index_slot_mapping,
+    cache_t* __restrict__ kv_cache, out_idx_t* __restrict__ index_cache,
+    float const eps, float const q_fp8_inv_scale, int const rotary_dim,
+    int const num_tokens, int const nq, int const nkv, int const niq,
+    int const block_size, int64_t const kv_s_block, int64_t const kv_s_head,
+    int64_t const kv_s_token, int64_t const kv_s_dim, int64_t const idx_s_block,
+    float const* __restrict__ kv_k_scale, float const* __restrict__ kv_v_scale,
+    bool const write_qkv) {
+  #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+  extern __shared__ __align__(16) uint8_t smem[];
+  Roles const roles(kQHeads, nq, nkv, niq, kInsertKV, kProcessIndex);
+  int const qkv_row = (nq + 2 * nkv + (kHasIndex ? niq + 1 : 0)) * kHeadDim;
+  // CTA (x, y) runs warps [y * cta_warps, (y + 1) * cta_warps) of the warp
+  // groups of tokens x, x + gridDim.x, ...
+  int const cta_warps = blockDim.x / 32;
+  int w = blockIdx.y * cta_warps + threadIdx.x / 32;
+  if (w >= roles.warps) return;
+  constexpr int kQStage = stageBytes<kQHeads>();
+  constexpr int kSideStage = stageBytes<kRows>();
+  int const q_ring = kStages * kQStage;
+  int const side_ring = kStages * kSideStage;
+  uint8_t* const ring_w =
+      smem + roles.ringOffset(w, q_ring, side_ring) -
+      roles.ringOffset(blockIdx.y * cta_warps, q_ring, side_ring);
+    #define RG_ARGS(NORM_W, SLOTS, CACHE_SCALE)                               \
+      qkv, q_out, q_fp8_out, index_q_out, NORM_W, cos_sin_cache, positions,   \
+          SLOTS, kv_cache, index_cache, eps, q_fp8_inv_scale, num_tokens, nq, \
+          niq, qkv_row, block_size, kv_s_block, kv_s_head, kv_s_token,        \
+          kv_s_dim, idx_s_block, CACHE_SCALE, write_qkv
+    #define RG_RUN(ROLE, STEPS, OUT)                                         \
+      runWarp<ROLE, STEPS, OUT, scalar_t, cache_t, kv_dt, kNvfp4, out_idx_t, \
+              kHasIndex, kInsertKV, kFp8Idx, kNvfp4Idx>
+    #define RG_RUN1(ROLE, OUT)                                           \
+      runWarp<ROLE, 1, OUT, scalar_t, cache_t, kv_dt, kNvfp4, out_idx_t, \
+              kHasIndex, kInsertKV, kFp8Idx, kNvfp4Idx, true>
+  if (w < roles.q_warps) {
+    int const h0 = w * kQHeads;
+    constexpr int kSteps = kQHeads / kRows;
+    uint8_t* const ring = ring_w;
+    int const rows = min(kQHeads, nq - h0);
+    if (q_out == nullptr && q_fp8_out != nullptr) {
+      if (q_fp8_inv_scale == 1.0f) {
+        RG_RUN(kQ, kSteps, kQFp8Unit)
+        (h0, rows, h0, ring, kQStage, RG_ARGS(q_norm_w, nullptr, 1.0f));
+      } else {
+        RG_RUN(kQ, kSteps, kQFp8)
+        (h0, rows, h0, ring, kQStage, RG_ARGS(q_norm_w, nullptr, 1.0f));
+      }
+    } else {
+      RG_RUN(kQ, kSteps, kQAny)
+      (h0, rows, h0, ring, kQStage, RG_ARGS(q_norm_w, nullptr, 1.0f));
+    }
+  } else {
+    uint8_t* const ring = ring_w;
+    w -= roles.q_warps;
+    if (w < roles.kv_warps) {
+      int const h0 = roles.kv_one ? w : w * kRows;
+      float const scale = kNvfp4 ? *kv_k_scale : 1.0f;
+      int const rows = roles.kv_one ? 1 : min(kRows, nkv - h0);
+      if (rows == 1) {
+        if (write_qkv) {
+          RG_RUN1(kK, kInPlace)
+          (h0, 1, nq + h0, ring, kSideStage,
+           RG_ARGS(k_norm_w, slot_mapping, scale));
+        } else {
+          RG_RUN1(kK, kNone)
+          (h0, 1, nq + h0, ring, kSideStage,
+           RG_ARGS(k_norm_w, slot_mapping, scale));
+        }
+      } else if (write_qkv) {
+        RG_RUN(kK, 1, kInPlace)
+        (h0, rows, nq + h0, ring, kSideStage,
+         RG_ARGS(k_norm_w, slot_mapping, scale));
+      } else {
+        RG_RUN(kK, 1, kNone)
+        (h0, rows, nq + h0, ring, kSideStage,
+         RG_ARGS(k_norm_w, slot_mapping, scale));
+      }
+    } else if ((w -= roles.kv_warps) < roles.v_warps) {
+      if constexpr (kInsertKV) {
+        int const h0 = roles.kv_one ? w : w * kRows;
+        int const rows = roles.kv_one ? 1 : min(kRows, nkv - h0);
+        float const scale = kNvfp4 ? *kv_v_scale : 1.0f;
+        if (rows == 1) {
+          RG_RUN1(kV, kNone)
+          (h0, 1, nq + nkv + h0, ring, kSideStage,
+           RG_ARGS(nullptr, slot_mapping, scale));
+        } else {
+          RG_RUN(kV, 1, kNone)
+          (h0, rows, nq + nkv + h0, ring, kSideStage,
+           RG_ARGS(nullptr, slot_mapping, scale));
+        }
+      }
+    } else if ((w -= roles.v_warps) < roles.iq_warps) {
+      if constexpr (kProcessIndex) {
+        int const h0 = roles.iq_one ? w : w * kRows;
+        int const rows = roles.iq_one ? 1 : min(kRows, niq - h0);
+        int const qh0 = nq + 2 * nkv + h0;
+        if (rows == 1) {
+          if (index_q_out != nullptr) {
+            RG_RUN1(kIQ, kIQOut)
+            (h0, 1, qh0, ring, kSideStage, RG_ARGS(iq_norm_w, nullptr, 1.0f));
+          } else if (write_qkv) {
+            RG_RUN1(kIQ, kIQInPlace)
+            (h0, 1, qh0, ring, kSideStage, RG_ARGS(iq_norm_w, nullptr, 1.0f));
+          } else {
+            RG_RUN1(kIQ, kNone)
+            (h0, 1, qh0, ring, kSideStage, RG_ARGS(iq_norm_w, nullptr, 1.0f));
+          }
+        } else if (index_q_out != nullptr) {
+          RG_RUN(kIQ, 1, kIQOut)
+          (h0, rows, qh0, ring, kSideStage, RG_ARGS(iq_norm_w, nullptr, 1.0f));
+        } else if (write_qkv) {
+          RG_RUN(kIQ, 1, kIQInPlace)
+          (h0, rows, qh0, ring, kSideStage, RG_ARGS(iq_norm_w, nullptr, 1.0f));
+        } else {
+          RG_RUN(kIQ, 1, kNone)
+          (h0, rows, qh0, ring, kSideStage, RG_ARGS(iq_norm_w, nullptr, 1.0f));
+        }
+      }
+    } else if constexpr (kProcessIndex) {
+      if (write_qkv) {
+        RG_RUN1(kIK, kInPlace)
+        (0, 1, nq + 2 * nkv + niq, ring, kSideStage,
+         RG_ARGS(ik_norm_w, index_slot_mapping, 1.0f));
+      } else {
+        RG_RUN1(kIK, kNone)
+        (0, 1, nq + 2 * nkv + niq, ring, kSideStage,
+         RG_ARGS(ik_norm_w, index_slot_mapping, 1.0f));
+      }
+    }
+  }
+    #undef RG_RUN
+    #undef RG_RUN1
+    #undef RG_ARGS
+    #if __CUDA_ARCH__ >= 900
+  cudaTriggerProgrammaticLaunchCompletion();
+    #endif
+  #endif
+}
+
+// Shared memory of the largest CTA of cta_warps warps.
+template <int kQHeads>
+__host__ inline int smemBytes(Roles const& r, int const cta_warps) {
+  int const q_ring = kStages * stageBytes<kQHeads>();
+  int const side_ring = kStages * stageBytes<kRows>();
+  int bytes = 0;
+  for (int w0 = 0; w0 < r.warps; w0 += cta_warps) {
+    int const w1 = std::min(w0 + cta_warps, r.warps);
+    bytes = std::max(bytes, r.ringOffset(w1, q_ring, side_ring) -
+                                r.ringOffset(w0, q_ring, side_ring));
+  }
+  return bytes;
+}
+
+// Launch with the grid this instantiation's occupancy allows: the CTAs walk
+// the tokens with stride gridDim.x.
+template <int kQHeads, typename scalar_t, typename cache_t,
+          Fp8KVCacheDataType kv_dt, bool kNvfp4, typename out_idx_t,
+          bool kHasIndex, bool kInsertKV, bool kProcessIndex, bool kFp8Idx,
+          bool kNvfp4Idx, typename... Args>
+void launch(cudaLaunchConfig_t config, int const num_tokens, Args... args) {
+  auto* const kernel =
+      fusedMiniMaxM3RowGroupKernel<kQHeads, scalar_t, cache_t, kv_dt, kNvfp4,
+                                   out_idx_t, kHasIndex, kInsertKV,
+                                   kProcessIndex, kFp8Idx, kNvfp4Idx>;
+  // Per CTA shape (warps, shared memory), computed once: the resident CTAs
+  // per SM.
+  static bool const opted_in =
+      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                           get_device_prop()->sharedMemPerBlockOptin) ==
+      cudaSuccess;
+  static int smem_of[kMaxWarps + 1] = {};
+  static int resident_of[kMaxWarps + 1] = {};
+  int const warps = config.blockDim.x / 32;
+  int const smem = static_cast<int>(config.dynamicSmemBytes);
+  if (smem_of[warps] != smem) {
+    (void)opted_in;
+    int n = 0;
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n, kernel, warps * 32, smem);
+    resident_of[warps] = n > 0 ? n : 1;
+    smem_of[warps] = smem;
+  }
+  int const ctas_per_token = config.gridDim.y;
+  config.gridDim.x = std::max(
+      1, std::min(num_tokens, get_device_prop()->multiProcessorCount *
+                                  resident_of[warps] / ctas_per_token));
+  cudaLaunchKernelEx(&config, kernel, args...);
+}
+
+}  // namespace rg
+#endif  // USE_ROCM
+
+#ifndef USE_ROCM
+// q heads per q warp: four (one step, shorter warps) for a launch of at most
+// 128 q rows, or while a token has at most 32 q heads and there are few q rows
+// per SM; eight otherwise (fewer, longer warps keep more CTAs resident).
+inline int rgQHeads(int const num_tokens, int const nq) {
+  static int const num_sms = get_device_prop()->multiProcessorCount;
+  int64_t const q_rows = static_cast<int64_t>(num_tokens) * nq;
+  return q_rows <= 128 || (nq <= 32 && q_rows < 64 * num_sms) ? 4 : 8;
+}
+// Warps per CTA: a token's whole warp group once there are enough tokens to
+// give every SM CTAs; before that, eight, which spreads a token over SMs.
+inline int rgCtaWarps(int const num_tokens) {
+  static int const num_sms = get_device_prop()->multiProcessorCount;
+  return 2 * num_tokens >= 3 * num_sms ? rg::kMaxWarps : 8;
+}
+#endif
+
 // ────────────────────────────────────────────────────────────────────────────
 // Launch wrapper
 // ────────────────────────────────────────────────────────────────────────────
@@ -839,7 +1686,7 @@ void launchFusedMiniMaxM3(
     int64_t const kv_s_dim, int64_t const idx_s_block, bool const has_index,
     bool const insert_kv, bool const process_index, bool const fp8_idx,
     bool const nvfp4_idx, float const* kv_k_scale, float const* kv_v_scale,
-    cudaStream_t stream) {
+    bool const write_qkv, bool const slots_fit_int32, cudaStream_t stream) {
   // Index outputs are scalar_t (bf16) or e4m3 bytes (uint8_t); reinterpret the
   // void* pointers per instantiation in the LAUNCH macro.
   // Slot count must match the kernel's compile-time gating.
@@ -871,18 +1718,58 @@ void launchFusedMiniMaxM3(
   config.attrs = attrs;
   config.numAttrs = (sm_version >= 90) ? 1 : 0;
 
-  #define LAUNCH(HAS_INDEX, INSERT, PROCESS_INDEX, FP8, NVFP4_IDX, OUT_T)   \
-    cudaLaunchKernelEx(                                                     \
-        &config,                                                            \
-        fusedMiniMaxM3QNormRopeKVInsertKernel<                              \
-            scalar_t, cache_t, kv_dt, kNvfp4, OUT_T, HAS_INDEX, INSERT,     \
-            PROCESS_INDEX, FP8, NVFP4_IDX>,                                 \
-        qkv, q_out, q_fp8_out, reinterpret_cast<OUT_T*>(index_q_out),       \
-        q_norm_w, k_norm_w, iq_norm_w, ik_norm_w, cos_sin_cache, positions, \
+  // The row-group kernel: same bytes, for rotary_dim == 64 on SM80+ (cp.async).
+  int const q_heads = rgQHeads(num_tokens, nq);
+  rg::Roles const roles(q_heads, nq, nkv, niq, insert_kv, process_index);
+  auto const rg_smem = [&](int const warps) {
+    return q_heads == 8 ? rg::smemBytes<8>(roles, warps)
+                        : rg::smemBytes<4>(roles, warps);
+  };
+  int cta_warps =
+      std::min({roles.warps, rgCtaWarps(num_tokens), rg::kMaxWarps});
+  // Eight warps take at most 63 KB; a whole group can exceed the 99 KB per
+  // block of SM 8.6 / 8.9 / 12.x.
+  static int const max_block_smem = get_device_prop()->sharedMemPerBlockOptin;
+  if (rg_smem(cta_warps) > max_block_smem) cta_warps = std::min(roles.warps, 8);
+  auto const aligned = [](void const* p, uintptr_t const n) {
+    return reinterpret_cast<uintptr_t>(p) % n == 0;
+  };
+  bool const row_groups =
+      sm_version >= 80 && rotary_dim == rg::kRotaryDim && slots_fit_int32 &&
+      aligned(qkv, 16) && aligned(cos_sin_cache, 16) && aligned(q_norm_w, 8) &&
+      aligned(k_norm_w, 8) && aligned(iq_norm_w, 8) && aligned(ik_norm_w, 8);
+  cudaLaunchConfig_t rg_config = config;
+  rg_config.blockDim = dim3(cta_warps * 32);
+  rg_config.gridDim = dim3(1, (roles.warps + cta_warps - 1) / cta_warps);
+  rg_config.dynamicSmemBytes = rg_smem(cta_warps);
+
+  #define LAUNCH_ARGS(OUT_T)                                                \
+    qkv, q_out, q_fp8_out, reinterpret_cast<OUT_T*>(index_q_out), q_norm_w, \
+        k_norm_w, iq_norm_w, ik_norm_w, cos_sin_cache, positions,           \
         slot_mapping, index_slot_mapping, kv_cache,                         \
         reinterpret_cast<OUT_T*>(index_cache), eps, q_fp8_inv_scale,        \
         rotary_dim, num_tokens, nq, nkv, niq, block_size, kv_s_block,       \
-        kv_s_head, kv_s_token, kv_s_dim, idx_s_block, kv_k_scale, kv_v_scale)
+        kv_s_head, kv_s_token, kv_s_dim, idx_s_block, kv_k_scale, kv_v_scale
+  #define LAUNCH_RG(QH, HAS_INDEX, INSERT, PROCESS_INDEX, FP8, NVFP4_IDX,      \
+                    OUT_T)                                                     \
+    rg::launch<QH, scalar_t, cache_t, kv_dt, kNvfp4, OUT_T, HAS_INDEX, INSERT, \
+               PROCESS_INDEX, FP8, NVFP4_IDX>(rg_config, num_tokens,           \
+                                              LAUNCH_ARGS(OUT_T), write_qkv)
+  #define LAUNCH(HAS_INDEX, INSERT, PROCESS_INDEX, FP8, NVFP4_IDX, OUT_T)      \
+    do {                                                                       \
+      if (!row_groups) {                                                       \
+        cudaLaunchKernelEx(                                                    \
+            &config,                                                           \
+            fusedMiniMaxM3QNormRopeKVInsertKernel<                             \
+                scalar_t, cache_t, kv_dt, kNvfp4, OUT_T, HAS_INDEX, INSERT,    \
+                PROCESS_INDEX, FP8, NVFP4_IDX>,                                \
+            LAUNCH_ARGS(OUT_T));                                               \
+      } else if (q_heads == 8) {                                               \
+        LAUNCH_RG(8, HAS_INDEX, INSERT, PROCESS_INDEX, FP8, NVFP4_IDX, OUT_T); \
+      } else {                                                                 \
+        LAUNCH_RG(4, HAS_INDEX, INSERT, PROCESS_INDEX, FP8, NVFP4_IDX, OUT_T); \
+      }                                                                        \
+    } while (0)
 #else
   // ROCm: standard kernel launch syntax (no PDL/stream serialization).
   // clang-format off
@@ -944,6 +1831,8 @@ void launchFusedMiniMaxM3(
     LAUNCH(false, false, false, false, false, scalar_t);  // dense
   }
 #undef LAUNCH
+#undef LAUNCH_RG
+#undef LAUNCH_ARGS
 }
 
 #ifndef USE_ROCM
@@ -1298,7 +2187,8 @@ void launchFusedMiniMaxM3DSparkContextKV(
       static_cast<int>(rotary_dim), num_tokens, nq, nkv, niq,                  \
       static_cast<int>(block_size), kv_s_block, kv_s_head, kv_s_token,         \
       kv_s_dim, idx_s_block, has_index, insert_kv, process_index, fp8_idx,     \
-      nvfp4_idx, kv_k_scale_ptr, kv_v_scale_ptr, stream)
+      nvfp4_idx, kv_k_scale_ptr, kv_v_scale_ptr, write_qkv, slots_fit_int32,  \
+      stream)
 #define CALL_FUSED_MINIMAX_M3(_RAW_T, CACHE_T, KV_DTYPE)                       \
   CALL_FUSED_MINIMAX_M3_IMPL(CACHE_T, KV_DTYPE, false)
 // clang-format on
@@ -1329,7 +2219,7 @@ void fused_minimax_m3_qknorm_rope_kv_insert(
         q_fp8_out,  // [N, nq*128] contiguous E4M3
     double q_fp8_scale,
     std::optional<torch::stable::Tensor> kv_k_scale,  // [] f32, NVFP4 only
-    std::optional<torch::stable::Tensor> kv_v_scale) {
+    std::optional<torch::stable::Tensor> kv_v_scale, bool write_qkv) {
   STD_TORCH_CHECK(qkv.is_cuda() && qkv.is_contiguous(),
                   "qkv must be contiguous CUDA");
   STD_TORCH_CHECK(
@@ -1500,6 +2390,9 @@ void fused_minimax_m3_qknorm_rope_kv_insert(
     STD_TORCH_CHECK(std::isfinite(q_fp8_scale) && q_fp8_scale > 0.0,
                     "q_fp8_scale must be finite and positive");
   }
+  STD_TORCH_CHECK(write_qkv || (!q_out.has_value() && q_fp8_out.has_value()),
+                  "write_qkv=False writes q only to q_fp8_out: pass q_fp8_out "
+                  "and no q_out");
   if (index_q_out.has_value()) {
     STD_TORCH_CHECK(process_index,
                     "index_q_out requires index branch processing");
@@ -1557,6 +2450,12 @@ void fused_minimax_m3_qknorm_rope_kv_insert(
       nvfp4_kv ? kv_k_scale->const_data_ptr<float>() : nullptr;
   float const* kv_v_scale_ptr =
       nvfp4_kv ? kv_v_scale->const_data_ptr<float>() : nullptr;
+
+  // The row-group kernel indexes cache slots in 32 bits.
+  bool const slots_fit_int32 =
+      !insert_kv ||
+      (kv_cache->size(0) * block_size <= INT32_MAX &&
+       (!process_index || index_cache->size(0) * block_size <= INT32_MAX));
 
   const torch::stable::accelerator::DeviceGuard device_guard(
       qkv.get_device_index());

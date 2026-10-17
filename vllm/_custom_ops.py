@@ -2619,6 +2619,7 @@ def fused_minimax_m3_qknorm_rope_kv_insert(
     q_fp8_scale: float = 1.0,
     kv_k_scale: torch.Tensor | None = None,
     kv_v_scale: torch.Tensor | None = None,
+    write_qkv: bool = True,
 ) -> None:
     """Fused MiniMax-M3 attention pre-processing (in-place).
 
@@ -2657,6 +2658,11 @@ def fused_minimax_m3_qknorm_rope_kv_insert(
     ``[index_q | index_k]`` tail, but the kernel only processes the main q/k/v
     branches and main KV cache. This is used by MiniMax-M3 index-topk reuse
     layers that consume top-k block ids selected by an earlier sparse layer.
+
+    ``write_qkv=False`` needs ``q_fp8_out`` without ``q_out``, for callers that
+    read only the FP8 q, ``index_q_out`` and the caches: k and index_k need not
+    be rewritten in ``qkv``. The persistent kernel (SM80+, ``rotary_dim`` 64)
+    skips those stores; the fallback kernel may still make them.
     """
     torch.ops._C.fused_minimax_m3_qknorm_rope_kv_insert(
         qkv,
@@ -2684,6 +2690,7 @@ def fused_minimax_m3_qknorm_rope_kv_insert(
         q_fp8_scale,
         kv_k_scale,
         kv_v_scale,
+        write_qkv,
     )
 
 

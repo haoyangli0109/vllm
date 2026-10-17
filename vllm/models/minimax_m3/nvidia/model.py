@@ -1048,9 +1048,10 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         else:
             # Horizontally-fused per-head Gemma QK-norm + partial NeoX RoPE on
             # the main (q/k) and index (index_q/index_k) branches, all read
-            # straight out of qkv. k/v and index_k are rewritten in place and
-            # scatter-inserted into the caches; q and index_q are de-interleaved
-            # into the dedicated contiguous buffers above.
+            # straight out of qkv. k/v and index_k are scatter-inserted into the
+            # caches; q and index_q are de-interleaved into the dedicated
+            # contiguous buffers above. With an E4M3 q nothing reads qkv
+            # afterwards, so k and index_k are not rewritten in place.
             ops.fused_minimax_m3_qknorm_rope_kv_insert(
                 qkv,
                 self.q_norm.weight,
@@ -1076,6 +1077,7 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
                 q_fp8_scale=self._q_scale_float,
                 kv_k_scale=self._k_scale if self.use_nvfp4_kv else None,
                 kv_v_scale=self._v_scale if self.use_nvfp4_kv else None,
+                write_qkv=not q_is_fp8,
             )
 
         output = torch.empty((num_tokens, self.q_size), dtype=dtype, device=device)
