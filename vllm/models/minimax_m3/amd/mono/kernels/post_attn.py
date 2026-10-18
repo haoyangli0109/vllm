@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """K4 ``mono_post``: one MiniMax-M3 sparse MoE layer, attention through FFN reduce.
@@ -43,8 +46,6 @@ CTAs are co-resident, so every spin wait makes progress.
 
 import struct
 
-from vllm.models.minimax_m3.amd.mono import config as mono_config
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
@@ -54,6 +55,7 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import Int32, Int64, T, as_ir_value
 
+from vllm.models.minimax_m3.amd.mono import config as mono_config
 from vllm.models.minimax_m3.amd.mono.config import (
     BLOCKS,
     HEAD_DIM,
@@ -89,7 +91,6 @@ from vllm.models.minimax_m3.amd.mono.kernels.common import (
     hw_rsq,
     kernel_symbol,
     memrealtime,
-    permlane_swap,
     rsrc,
     uniform,
     unlikely,
@@ -181,8 +182,6 @@ TL_POINTS = 32  # timeline stamps per CTA
 K1_STAMPS = {1: 27, 2: 28, 3: 29, 4: 30, 6: 31}  # fuse_k1: K1's points -> K4's
 RANK_SPLIT = 8  # threads ranking one indexer block
 RANK_LANES = (4, 2, 1)  # butterfly over those RANK_SPLIT lanes
-RANK_CANDS = THREADS // (WAVES * TOPK_BLOCKS)  # threads ranking one candidate
-RANK_CAND_LANES = (2, 1)  # butterfly over those RANK_CANDS lanes
 KEY_NONE = -(2**31)  # the sort key below every block's
 # blocks a thread keys in its split task's eighth of a context (<= MAX_INDEX_BLOCKS)
 CAND_BATCH = 2
@@ -420,7 +419,7 @@ def build_post_attn_kernel(
             """``timeline``: s_memrealtime (100 MHz) of this CTA passing point k, kept
             in LDS until the kernel ends -- a global store per stamp would put its
             write latency on every later ``s_waitcnt vmcnt(0)``."""
-            # compile-time gate outside, traced condition inside: they cannot be one `and`
+            # The compile-time and traced conditions cannot share one ``and``.
             if const_expr(timeline):  # noqa: SIM102
                 if tid == 0:
                     fx.ptr_store(memrealtime(), tls + k)
@@ -503,9 +502,10 @@ def build_post_attn_kernel(
                 eps, index_scale_log2e(sm_scale), tokens, q_len, init_blocks,
                 local_blocks, IndexHeads(ih_count, ih_own),
                 (
-                    ar_in, res, h_in, g_in, w_qkv, s_qkv, g_q, g_k, g_iq, g_ik, cos_sin,
-                    positions, slot_mapping, k_cache, v_cache, k_scale, v_scale,
-                    index_cache, q, iq_out, block_table, seq_lens, mb("iscore"), scratch1,
+                    ar_in, res, h_in, g_in, w_qkv, s_qkv, g_q, g_k, g_iq, g_ik,
+                    cos_sin, positions, slot_mapping, k_cache, v_cache, k_scale,
+                    v_scale, index_cache, q, iq_out, block_table, seq_lens,
+                    mb("iscore"), scratch1,
                 ),
                 bt_width,
                 True,
@@ -622,55 +622,75 @@ def build_post_attn_kernel(
             """(key, block) pair a orders before b."""
             return (ah > bh) | ((ah == bh) & (al > bl))
 
-        def pair_best(bh, bl, off):
-            """The better (key, block) pair of this lane's and lane ^ off's; offsets
-            32 / 16 by v_permlane*_swap (no LDS round trip)."""
-            if const_expr(off < 16):
-                oh, ol = xshfl(bh, off), xshfl(bl, off)
-                up = beats(oh, ol, bh, bl)
-                return up.select(oh, bh), up.select(ol, bl)
-            ah, xh = permlane_swap(off, bh, bh)
-            al, xl = permlane_swap(off, bl, bl)
-            up = beats(xh, xl, ah, al)
-            return up.select(xh, ah), up.select(xl, al)
+        def choose_pair(key, block, peer_key, peer_block, take_high):
+            partner_high = beats(peer_key, peer_block, key, block)
+            high_h = partner_high.select(peer_key, key)
+            high_l = partner_high.select(peer_block, block)
+            low_h = partner_high.select(key, peer_key)
+            low_l = partner_high.select(block, peer_block)
+            return take_high.select(high_h, low_h), take_high.select(high_l, low_l)
+
+        def merge16_best(ah, al, bh, bl):
+            """Return the top half of two descending 16-item lists."""
+            b_hi = beats(bh, bl, ah, al)
+            key, block = b_hi.select(bh, ah), b_hi.select(bl, al)
+            for off in (8, 4, 2, 1):
+                ph, pl = xshfl(key, off), xshfl(block, off)
+                p_hi = beats(ph, pl, key, block)
+                hi_h, hi_l = p_hi.select(ph, key), p_hi.select(pl, block)
+                lo_h, lo_l = p_hi.select(key, ph), p_hi.select(block, pl)
+                take_hi = (l16 & off) == 0
+                key = take_hi.select(hi_h, lo_h)
+                block = take_hi.select(hi_l, lo_l)
+            return key, block
+
+        def sort16_desc(key, block):
+            for size, strides in (
+                (2, (1,)),
+                (4, (2, 1)),
+                (8, (4, 2, 1)),
+                (16, (8, 4, 2, 1)),
+            ):
+                for stride in strides:
+                    ph, pl = xshfl(key, stride), xshfl(block, stride)
+                    asc = (l16 & size) != 0
+                    low = (l16 & stride) == 0
+                    key, block = choose_pair(key, block, ph, pl, low ^ asc)
+            return key, block
 
         def wave_best(h0, l0, h1, l1):
-            """The wave's TOPK_BLOCKS best of its lanes' two (key, block) pairs, best
-            first in lanes 0..15: round r moves the best pair left to lane r and
-            drops it from its holder. A runtime loop: unrolled, rare code like this
-            raised the kernel's SGPR spills (S = 16, 3k context: +3 us)."""
-            none_h, none_l = fx.Int32(KEY_NONE), fx.Int32(-1)
-            rh, rl = none_h, none_l
-            for r in range(TOPK_BLOCKS):
-                up = beats(h1, l1, h0, l0)
-                bh, bl = up.select(h1, h0), up.select(l1, l0)
-                for off in (32, 16, 8, 4, 2, 1):
-                    bh, bl = pair_best(bh, bl, off)
-                rh = (lane == r).select(bh, rh)
-                rl = (lane == r).select(bl, rl)
-                gone = (h0 == bh) & (l0 == bl)
-                h0, l0 = gone.select(none_h, h0), gone.select(none_l, l0)
-                gone = (h1 == bh) & (l1 == bl)
-                h1, l1 = gone.select(none_h, h1), gone.select(none_l, l1)
-            return rh, rl
+            """Return the exact top 16 of 128 pairs in lanes 0..15."""
+            h0, l0 = sort16_desc(h0, l0)
+            h1, l1 = sort16_desc(h1, l1)
+            h0, l0 = merge16_best(h0, l0, xshfl(h0, 31), xshfl(l0, 31))
+            h1, l1 = merge16_best(h1, l1, xshfl(h1, 31), xshfl(l1, 31))
+            h0, l0 = merge16_best(h0, l0, xshfl(h0, 47), xshfl(l0, 47))
+            h1, l1 = merge16_best(h1, l1, xshfl(h1, 47), xshfl(l1, 47))
+            h0, l0 = merge16_best(
+                h0,
+                l0,
+                h1.shuffle_xor(15, 64),
+                l1.shuffle_xor(15, 64),
+            )
+            return h0, l0
 
         def rank_cands():
-            """Candidate tid / RANK_CANDS of the WAVES TOPK_BLOCKS (key, block)
-            pairs in ``keys`` and its rank, the count of candidates that beat it ->
-            (key, block, rank, held: this thread reports it and it is a block)."""
-            c = tid // RANK_CANDS
-            part = tid % RANK_CANDS
-            ch = fx.ptr_load(keys + 2 * c)
-            cl = fx.ptr_load(keys + (2 * c + 1))
-            cnt = fx.Int32(0)
-            for j0 in range_constexpr(0, WAVES * TOPK_BLOCKS, RANK_CANDS):
-                j = part + j0
-                up = beats(
-                    fx.ptr_load(keys + 2 * j), fx.ptr_load(keys + (2 * j + 1)), ch, cl
+            """Merge eight sorted candidate rows to the exact top 16."""
+            key, block = fx.Int32(KEY_NONE), fx.Int32(-1)
+            if wave == 0:
+                group = lane // TOPK_BLOCKS
+                index = l16
+                ai = (2 * group) * TOPK_BLOCKS + index
+                bi = (2 * group + 1) * TOPK_BLOCKS + (TOPK_BLOCKS - 1 - index)
+                key, block = merge16_best(
+                    fx.ptr_load(keys + 2 * ai),
+                    fx.ptr_load(keys + (2 * ai + 1)),
+                    fx.ptr_load(keys + 2 * bi),
+                    fx.ptr_load(keys + (2 * bi + 1)),
                 )
-                cnt = cnt + up.select(fx.Int32(1), fx.Int32(0))
-            cnt = butterfly(cnt, RANK_CAND_LANES)
-            return ch, cl, cnt, (part == 0) & (cl >= 0)
+                key, block = merge16_best(key, block, xshfl(key, 31), xshfl(block, 31))
+                key, block = merge16_best(key, block, xshfl(key, 47), xshfl(block, 47))
+            return key, block, tid, (tid < TOPK_BLOCKS) & (block >= 0)
 
         def place(key, bb, rank, live, kt, n_blk, seq_len, active):
             """The ranked blocks' slots, as the Triton selector emits them: full
@@ -753,7 +773,7 @@ def build_post_attn_kernel(
             iscore = mb("iscore") + fx.Int64(k) * (MAX_INDEX_BLOCKS * 8)
             first = k * (N_SPLIT * TOPK_BLOCKS)  # token k's candidates (pair pairs)
             table = table_of(k)
-            if tid == 0:
+            if tid == 0:  # the tail flag ``place`` reads: LDS, not zeroed on this path
                 fx.ptr_store(fx.Int32(0), blk + 17)
             if const_expr(ih_count > 1):
                 own0 = init_blocks + (ih_own - init_blocks) % TP  # this rank's first
@@ -823,7 +843,13 @@ def build_post_attn_kernel(
             gpu.barrier()
             ch, cl, cnt, held = rank_cands()
             page = fx.Int32(
-                bo.buffer_load(rsrc(bt_row(k)), fx.max(cl, 0), vec_width=1, dtype=T.i32)
+                bo.buffer_load(
+                    rsrc(bt_row(k), MAX_INDEX_BLOCKS * 4),
+                    cl,
+                    vec_width=1,
+                    dtype=T.i32,
+                    mask=held,
+                )
             )
             stamp(19)
             # the tail block is a local one: its key is forced
@@ -840,7 +866,9 @@ def build_post_attn_kernel(
             if sel & (part == 0):
                 for j in range_constexpr(PAGES_PER_BLOCK):
                     bo.buffer_store(
-                        page * mono_config.KV_PAGE_STRIDE + j, table, slot * PAGES_PER_BLOCK + j
+                        page * mono_config.KV_PAGE_STRIDE + j,
+                        table,
+                        slot * PAGES_PER_BLOCK + j,
                     )
             if tid == 0:
                 fx.ptr_store(n_ctx, blk + 16)
@@ -962,7 +990,8 @@ def build_post_attn_kernel(
                 fx.ptr_store(fp8_pack4(qv[0], qv[1], qv[2], qv[3]), q8 + tid)
                 gpu.barrier()
                 stamp(12)
-                # QK per page j: A = q (heads), B = K (keys); lane holds heads 4 g4 + e, key l16
+                # QK per page: A=q (heads), B=K (keys); a lane holds heads
+                # 4*g4+e and key l16.
                 key0 = t * SPLIT_KEYS + wave * (PPW * PAGE16)
                 valid = [key0 + j * PAGE16 + l16 < n_ctx for j in range(PPW)]
                 sc = []
@@ -1069,7 +1098,7 @@ def build_post_attn_kernel(
                         )
                 gpu.barrier()
                 stamp(15)
-                # sum the waves' partials; gluon: acc = prob_scale * PV, then * (1 / exp_sum), bf16
+                # Sum wave partials: acc=prob_scale*PV, then /exp_sum, bf16.
                 e0 = tid * 4
                 head = e0 // HEAD_DIM
                 lsum = fx.ptr_load(hst + (WAVES * H + head))
@@ -1337,24 +1366,25 @@ def build_post_attn_kernel(
                             )
                 if const_expr(not AG_RS):  # noqa: SIM102
                     # this task's rows of the all-reduce, finished here (GLM's
-                    # peer_reduce): every peer's partials summed in rank order, bf16, plus
-                    # the residual -> h_mid and the 'a' mailbox. A router task then reads
-                    # 24 KB of device-scope bf16, not 4 peers' 48 KB of system-scope ones
+                    # peer_reduce): sum peer partials in rank order, bf16, then
+                    # add the residual into h_mid and the 'a' mailbox. A router
+                    # reads 24 KB device-scope, not 4 peers' 48 KB system-scope.
                     if tid < O_ROWS // 2 * tokens:
                         ptk = tid // (O_ROWS // 2)
                         row = t * O_ROWS + (tid % (O_ROWS // 2)) * 2
-                        if const_expr(fuse_k1):  # the residual (K1's norm / GEMV task)
-                            k1_poll([(rdone_mb, ptk, 1)])
-                            acquire()
-                        hr = fx.Int32(
-                            bo.buffer_load(
-                                rsrc(h_in),
-                                (ptk * HIDDEN + row) // 2,
-                                vec_width=1,
-                                dtype=T.i32,
-                                cache_modifier=CM_K1,
+                        if const_expr(tokens != 1):
+                            if const_expr(fuse_k1):
+                                k1_poll([(rdone_mb, ptk, 1)])
+                                acquire()
+                            hr = fx.Int32(
+                                bo.buffer_load(
+                                    rsrc(h_in),
+                                    (ptk * HIDDEN + row) // 2,
+                                    vec_width=1,
+                                    dtype=T.i32,
+                                    cache_modifier=CM_K1,
+                                )
                             )
-                        )
                         own = sym + fx.Int64(SY["attn"])
                         prt = mb_poll(
                             [
@@ -1369,19 +1399,20 @@ def build_post_attn_kernel(
                             f0, f1 = bf2_f32(prt[src][0])
                             t0 = t0 + f0
                             t1 = t1 + f1
-                        r0, r1 = bf2_f32(hr)
-                        a0 = bf16_round(t0) + r0
-                        a1 = bf16_round(t1) + r1
                         # the rank sum only: the router adds the residual in f32, so the
-                        # norm reads bf16(sum) + residual unrounded, as the original path
+                        # norm reads bf16(sum) plus the unrounded residual.
                         mb_put_bf(mb("a"), ptk * HIDDEN + row, [t0, t1])
-                        bo.buffer_store(
-                            fx.Vector.from_elements([a0, a1], fx.Float32).to(
-                                fx.BFloat16
-                            ),
-                            rsrc(h_mid),
-                            ptk * HIDDEN + row,
-                        )
+                        if const_expr(tokens != 1):
+                            r0, r1 = bf2_f32(hr)
+                            a0 = bf16_round(t0) + r0
+                            a1 = bf16_round(t1) + r1
+                            bo.buffer_store(
+                                fx.Vector.from_elements([a0, a1], fx.Float32).to(
+                                    fx.BFloat16
+                                ),
+                                rsrc(h_mid),
+                                ptk * HIDDEN + row,
+                            )
 
         stage_o()
         stamp(4)
@@ -1510,9 +1541,7 @@ def build_post_attn_kernel(
             as the f8f6f4 MFMA's 8-dword A operand."""
             word = (tile * F8_TILE + slot * 32) // 4
             h = [
-                fx.Vector(
-                    bo.buffer_load(r_w, word + 4 * j, vec_width=4, dtype=T.i32)
-                )
+                fx.Vector(bo.buffer_load(r_w, word + 4 * j, vec_width=4, dtype=T.i32))
                 for j in range(2)
             ]
             return fx.Vector.from_elements(
@@ -1527,9 +1556,7 @@ def build_post_attn_kernel(
             v = fx.Vector(
                 bo.buffer_load(rsrc(sh_args), 2 * i, vec_width=2, dtype=T.i32)
             )
-            return (fx.Int64(uniform(v[1])) << 32) | fx.Int64(
-                fx.Uint32(uniform(v[0]))
-            )
+            return (fx.Int64(uniform(v[1])) << 32) | fx.Int64(fx.Uint32(uniform(v[0])))
 
         def w_tile(r_w, rg, kc, slot, k, fp8):
             """Lane ``slot``'s A operand of row group rg, 128-k chunk kc of a table
@@ -1619,7 +1646,7 @@ def build_post_attn_kernel(
                     for qq in range(2)
                     for i, f in enumerate(bf2_f32(arow[h][qq]))
                 ]
-                if const_expr(AG_RS):  # noqa: SIM102
+                if const_expr(AG_RS or tokens == 1):  # noqa: SIM102
                     # h_mid = bf16(bf16(sum) + residual): task t writes slice t
                     if tid // (XN_SLICE // RE) == t:
                         hw = (k * HIDDEN + tid * RE) // 2
@@ -1773,8 +1800,8 @@ def build_post_attn_kernel(
             )
             r_w = rsrc(w13 + fx.Int64(e_u) * W13_BYTES)
             r_s = rsrc(s13)
-            wts = []  # [gate, up][chunk]
-            scs = []
+            wts: list[list] = []  # [gate, up][chunk]
+            scs: list[list] = []
             for gu in range_constexpr(2):
                 rg = gu * UG_PER_SLOT + cg
                 wts.append([])
@@ -1864,13 +1891,11 @@ def build_post_attn_kernel(
                 r_s = rsrc(s_base, has.select(fx.Int32(s_bytes), fx.Int32(0)))
             wts = []
             scs = []
-            # the row's part of scale_index, once: a chunk adds 256 (kc / 2) + 2 (kc % 2)
+            # Row offset; each chunk adds 256 * (kc // 2) + 2 * (kc % 2).
             sc_row = scale_index(e_rows + row, g4, W13_SCALE_COLS)
             for i in range_constexpr(UG_CPW):
                 kc = wave * UG_CPW + i
-                wts.append(
-                    w_tile(r_w, rg, kc, g4 * 16 + row % 16, HIDDEN, shared_fp8)
-                )
+                wts.append(w_tile(r_w, rg, kc, g4 * 16 + row % 16, HIDDEN, shared_fp8))
                 scs.append(e8m0_load(r_s, sc_row + kc // 2 * 256 + kc % 2 * 2))
             return wts, scs
 
@@ -1885,9 +1910,7 @@ def build_post_attn_kernel(
             ]
             for i in range_constexpr(UG_CPW):
                 kc = wave * UG_CPW + i
-                c = mfma_sh(
-                    wts[i], scs[i], lds_b8(col * XN8_ROW + kc * 32), sbs[i], c
-                )
+                c = mfma_sh(wts[i], scs[i], lds_b8(col * XN8_ROW + kc * 32), sbs[i], c)
             fx.ptr_store(c, red + (wave * 64 + lane) * 4)
             gpu.barrier()
             # mid row r = tid % 8 of token tid / 8: gate in tile row r, up in r + 8
@@ -1962,13 +1985,15 @@ def build_post_attn_kernel(
                 j = (wave % 4) + 4 * i
                 kc = fx.min(j, DN_KC - 1)
                 wv = w_tile(r_w, rg_d, kc, lane, INTER, shared_fp8)
-                sc = e8m0_load(r_s, group_scale_byte(e, HIDDEN, rg_d, kc, W2_SCALE_COLS))
+                sc = e8m0_load(
+                    r_s, group_scale_byte(e, HIDDEN, rg_d, kc, W2_SCALE_COLS)
+                )
                 wgt = (j < DN_KC).select(fx.Float32(shared_weight), fx.Float32(0.0))
                 units.append((wv, sc, kc, wgt))
             return units
 
         def ffn_finish(t):
-            """misc (row group t's bf16 partial rows, token k's DN_ROWS from k DN_ROWS)
+            """Misc (row group t's bf16 partial rows, token k's DN_ROWS from k DN_ROWS)
             -> every peer -> rank-ordered sum -> ar_out."""
             # every token's rows: reduce threads take token tid // 16, pair tid % 16
             row_tok = tid // (DN_ROWS // 2)
@@ -2080,7 +2105,7 @@ def build_post_attn_kernel(
             return s
 
         def build_experts():
-            """uexp / umask[0 .. n_u) := the tokens' distinct routed experts in
+            """Uexp / umask[0 .. n_u) := the tokens' distinct routed experts in
             expert order and their token masks, [n_u] := the shared expert (every
             token), uexp[U_MAX + 1] := n_u. The waves' masks must be in (synced)."""
             m = fx.Int32(0)
@@ -2133,8 +2158,8 @@ def build_post_attn_kernel(
                     has.select(fx.Int32(W13_BYTES), fx.Int32(0)),
                 )
                 r_s = rsrc(s13, has.select(fx.Int32(S13_BYTES), fx.Int32(0)))
-            wts = []
-            scs = []
+            wts: list[list] = []
+            scs: list[list] = []
             for gu in range_constexpr(2):
                 rg = gu * UG_PER_SLOT + cg
                 wts.append([])
@@ -2254,7 +2279,7 @@ def build_post_attn_kernel(
                 mb_put(mb("ugdone"), pr, fx.Int32(1))
 
         def down_tables():
-            """urow / uwt := per (distinct expert, B column) the down stage's mid row
+            """Urow / uwt := per (distinct expert, B column) the down stage's mid row
             (the zero row where the column's token is not routed there) and route
             weight. Routing only: built while the first up / gate weights land."""
             nu = uniform(fx.ptr_load(uexp + (U_MAX + 1)))
@@ -2499,16 +2524,16 @@ def build_post_attn_kernel(
             if const_expr(shared_fp8):
                 # the MXFP8 shared expert's units (wave % 4 + 4 i): no routing needed,
                 # their weights go out first
-                r_shw = rsrc(sh_ptr(SH_W2))
-                r_shs = rsrc(sh_ptr(SH_S2))
+                r_shared_w = rsrc(sh_ptr(SH_W2))
+                r_shared_s = rsrc(sh_ptr(SH_S2))
                 sh_dn = []
                 for i in range_constexpr(SH_UPW):
                     skc = fx.min(wave % 4 + 4 * i, DN_KC - 1)
                     sh_dn.append(
                         (
-                            f8_tile_load(r_shw, rg_d * (INTER // 128) + skc, lane),
+                            f8_tile_load(r_shared_w, rg_d * (INTER // 128) + skc, lane),
                             e8m0_load(
-                                r_shs,
+                                r_shared_s,
                                 group_scale_byte(0, HIDDEN, rg_d, skc, W2_SCALE_COLS),
                             ),
                             skc,

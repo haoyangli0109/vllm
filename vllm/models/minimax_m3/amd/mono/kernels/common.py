@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Device-side building blocks shared by the mono kernels.
@@ -254,7 +257,7 @@ def _spin(load_all, pending):
     loop keeps the loads from being hoisted."""
     v = load_all()
     while pending(v):
-        rocdl.s_sleep(1)
+        rocdl.s_sleep(0)
         v = load_all()
     return v
 
@@ -290,7 +293,7 @@ class Mailbox:
         )
 
     def put_bf(self, base_addr, i, vs, cm=CM_DEV):
-        """Elements i .. i+len(vs) (2 or 4, i aligned) as packed bf16 pairs, one store."""
+        """Store 2 or 4 elements as aligned packed bf16 pairs."""
         words = []
         for j in range_constexpr(len(vs) // 2):
             words += [bf16_pair(vs[2 * j], vs[2 * j + 1]).bitcast(fx.Int32), self.tag]
@@ -316,7 +319,7 @@ class Mailbox:
         )
 
     def poll(self, specs, scope="agent", batch=POLL_MAX):
-        """Batched poll of pairs ``specs`` = [(base_addr, pair index, npairs in {1, 2})].
+        """Poll ``(base_addr, pair index, npairs)`` specs in one batch.
 
         All pairs are re-loaded together while any tag is stale, so a batch costs
         one round trip after its last producer lands. ``scope``: "agent" for pairs

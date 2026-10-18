@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """K1 ``mono_pre``: one MiniMax-M3 sparse layer, input norm through cache insert.
@@ -87,6 +90,8 @@ def page16_of(slot):
         return slot // PAGE16
     blk, t = slot // mono_config.SPARSE_BLOCK, slot % mono_config.SPARSE_BLOCK
     return blk * kps + t // PAGE16
+
+
 # GEMV tasks, head tasks (every token of a head on one CTA) and the tokens' norm
 # tasks each own a CTA, in this order; a head CTA's half waves hold the tokens.
 # The rank's own rows (q | k | v | its index q | index k) are the first ONE_GEMV
@@ -604,8 +609,8 @@ def emit_k1(
 ):  # fmt: skip
     """K1 whole: the GEMV / head / norm tasks, then every CTA's indexer scores.
     ``x8``: tokens * HIDDEN / 4 words of LDS, ``red``: WAVES * 256 floats, ``qs``:
-    tokens * heads.count * HEAD_DIM / 2 floats. ``q_len``: tokens per request (speculative
-    verify rows). ``heads``: the index q heads of the fused projection
+    tokens * heads.count * HEAD_DIM / 2 floats. ``q_len``: tokens per request
+    (speculative verify rows). ``heads``: the index q heads of the fused projection
     (``IndexHeads``). ``signal`` (the fused layer kernel): the head tasks and
     residual writers publish done flags (SCRATCH_HDONE / SCRATCH_RDONE)."""
     (
@@ -680,8 +685,9 @@ def emit_k1(
         tid, bid, lane, wave, x8, red, mb_put, mb_put_words, mb_poll, qkv_mb, x8_mb,
         x8s_mb, stamp, eps, tokens, heads,
         (
-            ar, res, h_out, g_in, w_qkv, s_qkv, g_q, g_k, g_iq, g_ik, cos_sin, positions,
-            slot_mapping, k_cache, v_cache, k_scale, v_scale, index_cache, q_out, iq_out,
+            ar, res, h_out, g_in, w_qkv, s_qkv, g_q, g_k, g_iq, g_ik,
+            cos_sin, positions, slot_mapping, k_cache, v_cache, k_scale,
+            v_scale, index_cache, q_out, iq_out,
         ),
         (mbox.addr(SCRATCH_HDONE), mbox.addr(SCRATCH_RDONE)) if signal else None,
         long_step,
@@ -700,9 +706,10 @@ def emit_k1(
         )
 
     emit_index_scores(
-        (bid + (BLOCKS - score_base)) % BLOCKS, lane, uniform(wave), red, mb_put, iscore,
-        q_frag, tokens, q_len, init_blocks, local_blocks, index_scale, index_cache,
-        block_table, seq_lens, bt_width, wait_new_keys if signal else None,
+        (bid + (BLOCKS - score_base)) % BLOCKS, lane, uniform(wave), red,
+        mb_put, iscore, q_frag, tokens, q_len, init_blocks, local_blocks,
+        index_scale, index_cache, block_table, seq_lens, bt_width,
+        wait_new_keys if signal else None,
         make_index_q, heads, q_frag_head, make_index_q_heads,
     )  # fmt: skip
     stamp(6)
@@ -797,7 +804,7 @@ def build_pre_attn_kernel(
         def stamp(k):
             """``timeline``: s_memrealtime (100 MHz) of this CTA passing point k, kept
             in LDS until the kernel ends."""
-            # compile-time gate outside, traced condition inside: they cannot be one `and`
+            # The compile-time and traced conditions cannot share one ``and``.
             if const_expr(timeline):  # noqa: SIM102
                 if tid == 0:
                     fx.ptr_store(memrealtime(), tls + k)
@@ -810,8 +817,9 @@ def build_pre_attn_kernel(
             tid, bid, lane, wave, x8, red, qs, stamp, step, layer, eps, index_scale,
             tokens, q_len, init_blocks, local_blocks, IndexHeads(ih_count, ih_own),
             (
-                ar, res, h_out, g_in, w_qkv, s_qkv, g_q, g_k, g_iq, g_ik, cos_sin, positions,
-                slot_mapping, k_cache, v_cache, k_scale, v_scale, index_cache, q_out,
+                ar, res, h_out, g_in, w_qkv, s_qkv, g_q, g_k, g_iq, g_ik,
+                cos_sin, positions, slot_mapping, k_cache, v_cache, k_scale,
+                v_scale, index_cache, q_out,
                 iq_out, block_table, seq_lens, iscore, scratch,
             ),
             bt_width,

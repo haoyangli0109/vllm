@@ -14,6 +14,8 @@ captured), and rebuilt when vLLM re-binds the KV cache after its memory-profilin
 capture round.
 """
 
+from typing import Any, cast
+
 import torch
 
 from vllm.config import VllmConfig
@@ -75,7 +77,6 @@ def _config_refusal(vllm_config: VllmConfig, model) -> str | None:
             "shared expert neither fused nor a separate MLP",
         ),
         (_dense_prefix_ok(model.layers), "layer mix"),
-        (not getattr(model, "aux_hidden_state_layers", ()), "Eagle3 aux layers"),
     )
     for ok, why in checks:
         if not ok:
@@ -83,7 +84,9 @@ def _config_refusal(vllm_config: VllmConfig, model) -> str | None:
     return None
 
 
-def _step_refusal(fwd: ForwardContext, layer_name: str, n: int, positions) -> str | None:
+def _step_refusal(
+    fwd: ForwardContext, layer_name: str, n: int, positions
+) -> str | None:
     """Why this step cannot run on the kernels, or None when it can."""
     if not 1 <= n <= MAX_TOKENS:
         return f"{n} tokens"
@@ -91,9 +94,11 @@ def _step_refusal(fwd: ForwardContext, layer_name: str, n: int, positions) -> st
         return f"positions {positions.dtype}"
     if fwd.ubatch_slices is not None:
         return "microbatched"
-    if not isinstance(fwd.attn_metadata, dict) or not isinstance(fwd.slot_mapping, dict):
+    if not isinstance(fwd.attn_metadata, dict) or not isinstance(
+        fwd.slot_mapping, dict
+    ):
         return "no per-layer metadata"
-    md = fwd.attn_metadata.get(layer_name)
+    md = cast(Any, fwd.attn_metadata.get(layer_name))
     if md is None or md.decode is None:
         return "no decode metadata"
     if md.num_prefills:
@@ -175,8 +180,9 @@ class MonoDecode:
         Checked once (a device sync)."""
         if self._slots_verified:
             return True
-        slots = fwd.slot_mapping[self._layer_name]
-        index_slots = fwd.slot_mapping.get(self._index_prefix)
+        slot_mapping = cast(dict[str, Any], fwd.slot_mapping)
+        slots = slot_mapping[self._layer_name]
+        index_slots = slot_mapping.get(self._index_prefix)
         if index_slots is None or not torch.equal(index_slots[:n], slots[:n]):
             self._disable("index cache does not share the KV cache's block ids")
             return False
@@ -195,7 +201,9 @@ class MonoDecode:
         fwd = get_forward_context()
         n = positions.numel()
         if envs.MONO_DEBUG and self._runner is not None:
-            log_step_debug(self._runner, fwd, self._layer_name, positions, inputs_embeds)
+            log_step_debug(
+                self._runner, fwd, self._layer_name, positions, inputs_embeds
+            )
         why = _step_refusal(fwd, self._layer_name, n, positions)
         if why is not None:
             if envs.MONO_DEBUG:
@@ -206,13 +214,20 @@ class MonoDecode:
     def _count_refusal(self, why: str, fwd: ForwardContext, n: int) -> None:
         """MONO_DEBUG: tally why steps stay on the original path (rank 0 logs
         every 100 declined steps)."""
-        md = fwd.attn_metadata.get(self._layer_name) if isinstance(fwd.attn_metadata, dict) else None
-        detail = (
-            f"{why} [n={n} prefills={md.num_prefills} decode_tokens={md.num_decode_tokens}]"
-            if md is not None else why
+        md = cast(
+            Any,
+            fwd.attn_metadata.get(self._layer_name)
+            if isinstance(fwd.attn_metadata, dict)
+            else None,
+        )
+        summary = (
+            f"{why} [n={n} prefills={md.num_prefills} "
+            f"decode_tokens={md.num_decode_tokens}]"
+            if md is not None
+            else why
         )
         counts = self.__dict__.setdefault("_refusals", {})
-        counts[detail] = counts.get(detail, 0) + 1
+        counts[summary] = counts.get(summary, 0) + 1
         total = sum(counts.values())
         if total % 100 == 0 and (self._runner is None or self._runner.rank == 0):
             logger.info("mono declined %d steps so far: %s", total, counts)

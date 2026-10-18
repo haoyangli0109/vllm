@@ -25,7 +25,10 @@ from vllm.models.minimax_m3.amd.mono.dispatch import (  # noqa: E402
     _config_refusal,
     _step_refusal,
 )
-from vllm.models.minimax_m3.amd.mono.runner import dense_prefix, token_rows  # noqa: E402
+from vllm.models.minimax_m3.amd.mono.runner import (  # noqa: E402
+    dense_prefix,
+    token_rows,
+)
 
 
 def _layer(moe: bool, sparse: bool):
@@ -60,8 +63,15 @@ def test_dense_prefix_counts_leading_dense_ffn_layers():
     "layers",
     [
         [_layer(False, True)] * 3,  # no MoE layer at all
-        [_layer(True, True), _layer(False, True), _layer(True, True)],  # dense after MoE
-        [_layer(False, True), _layer(True, False)],  # MoE layer without sparse attention
+        [
+            _layer(True, True),
+            _layer(False, True),
+            _layer(True, True),
+        ],  # dense after MoE
+        [
+            _layer(False, True),
+            _layer(True, False),
+        ],  # MoE layer without sparse attention
     ],
 )
 def test_dense_prefix_refuses_other_layer_mixes(layers):
@@ -92,7 +102,9 @@ def _vllm_config(**overrides):
         cache_config=SimpleNamespace(cache_dtype="fp8", block_size=SPARSE_BLOCK),
         compilation_config=SimpleNamespace(cudagraph_mode=cg),
         model_config=SimpleNamespace(max_model_len=32768),
-        attention_config=SimpleNamespace(resolve_indexer_kv_dtype=lambda default: "fp8"),
+        attention_config=SimpleNamespace(
+            resolve_indexer_kv_dtype=lambda default: "fp8"
+        ),
     )
     for path, value in overrides.items():
         obj, _, attr = path.rpartition(".")
@@ -114,8 +126,9 @@ def _model(fse: bool = True, shared_mlp: bool = True, aux=()):
 
 
 @pytest.mark.parametrize("fse", [True, False])
-def test_config_refusal_accepts_the_supported_deployment(fse):
-    assert _config_refusal(_vllm_config(), _model(fse=fse)) is None
+@pytest.mark.parametrize("aux", [(), (2, 30, 57)])
+def test_config_refusal_accepts_the_supported_deployment(fse, aux):
+    assert _config_refusal(_vllm_config(), _model(fse=fse, aux=aux)) is None
 
 
 @pytest.mark.parametrize(
@@ -130,7 +143,6 @@ def test_config_refusal_accepts_the_supported_deployment(fse):
             "max_model_len",
         ),
         (_vllm_config(), _model(fse=False, shared_mlp=False), "neither fused nor"),
-        (_vllm_config(), _model(aux=(2, 30)), "Eagle3"),
     ],
 )
 def test_config_refusal_names_the_unmet_condition(cfg, model, why):
@@ -166,5 +178,7 @@ def test_step_refusal_rejects_what_the_kernels_cannot_serve():
     assert "shorter" in _step_refusal(_fwd(4, reqs=2), "attn", 4, pos)
     assert "positions" in _step_refusal(_fwd(4), "attn", 4, pos.to(torch.int32))
     fwd = _fwd(4)
-    fwd.attn_metadata["attn"].decode.block_table = fwd.attn_metadata["attn"].decode.block_table.t()
+    fwd.attn_metadata["attn"].decode.block_table = fwd.attn_metadata[
+        "attn"
+    ].decode.block_table.t()
     assert "contiguous" in _step_refusal(fwd, "attn", 4, pos)

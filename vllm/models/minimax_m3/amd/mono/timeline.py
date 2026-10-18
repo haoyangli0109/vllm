@@ -1,9 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Phase stamps of the mono layer kernel inside the server (debug only).
 
-``VLLM_ROCM_MINIMAX_M3_MONO_TIMELINE=<prefix>``, meant for ``--enforce-eager`` (a graph replay
-runs no Python, so nothing would be saved): the layer kernels are built with their
+``VLLM_ROCM_MINIMAX_M3_MONO_TIMELINE=<prefix>``, for ``--enforce-eager`` (a
+graph replay runs no Python, so nothing would be saved): kernels are built with
 timeline stamps, every sparse layer writes its own buffer, and past the warm-up
 steps of each decode token count a few steps are saved as
 ``<prefix>_r<rank>_s<S>_<i>.pt`` -- int64 [layer][CTA][stamp], ``s_memrealtime``
@@ -28,7 +31,7 @@ class LayerTimeline:
         self.stamps = torch.zeros(
             n_layers, BLOCKS, TL_POINTS, dtype=torch.int64, device=dev
         )
-        self.steps = collections.Counter()
+        self.steps: collections.Counter[int] = collections.Counter()
 
     def ptr(self, layer: int) -> int:
         return self.stamps[layer].data_ptr()

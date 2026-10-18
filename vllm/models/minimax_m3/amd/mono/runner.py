@@ -11,7 +11,7 @@ page-16 layout under the fixed unit fp8 scale; the step's tables come from the
 forward context.
 """
 
-from typing import NamedTuple
+from typing import Any, NamedTuple, cast
 
 import torch
 
@@ -30,11 +30,11 @@ from vllm.models.minimax_m3.amd.mono.config import (
     LOCAL_Q_HEADS,
     MAX_TOKENS,
     N_ROUTED,
-    ONE_INDEX_HEAD,
     PAGE16,
     TOP_K,
     TOPK_BLOCKS,
     TP,
+    IndexHeads,
     MonoUnsupported,
 )
 from vllm.models.minimax_m3.amd.mono.envs import envs
@@ -48,6 +48,7 @@ from vllm.models.minimax_m3.amd.mono.layout import sym_layout
 from vllm.models.minimax_m3.amd.mono.peer_buffer import PeerBuffer
 from vllm.models.minimax_m3.amd.mono.timeline import LayerTimeline
 from vllm.models.minimax_m3.amd.mono.weights import SparseMoeLayer, build_sparse_layer
+from vllm.platforms import current_platform
 
 
 def _ptr(t: torch.Tensor) -> int:
@@ -111,10 +112,14 @@ class MonoDecodeRunner:
         self.model = model
         self.rank = get_tensor_model_parallel_rank()
         layers = list(model.layers)
-        heads = ONE_INDEX_HEAD  # indexer context parallelism is not wired here
+        # Enable indexer context parallelism: each rank computes all TP index
+        # heads, allowing local block scoring without cross-rank exchange.
+        heads = IndexHeads(count=TP, own=self.rank)
+        tp_group = get_tp_group().device_group
         self.n_dense = n_dense = dense_prefix(layers)
         self.sparse = [
-            build_sparse_layer(layers[i], i, heads) for i in range(n_dense, len(layers))
+            build_sparse_layer(layers[i], i, heads, rank=self.rank, tp_group=tp_group)
+            for i in range(n_dense, len(layers))
         ]
         attn0 = layers[n_dense].self_attn
         moe0 = layers[n_dense].block_sparse_moe
@@ -165,7 +170,7 @@ class MonoDecodeRunner:
     def step_tables(self, n: int) -> StepTables:
         """The current step's tables for ``n`` tokens, from the forward context."""
         fwd = get_forward_context()
-        decode = fwd.attn_metadata[self.layer_name].decode
+        decode = cast(Any, fwd.attn_metadata[self.layer_name]).decode
         q = decode.decode_query_len
         block_table, seq_lens = token_rows(decode.block_table, decode.seq_lens, q, n)
         return StepTables(block_table, seq_lens, fwd.slot_mapping[self.layer_name], q)
@@ -175,6 +180,7 @@ class MonoDecodeRunner:
         input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         inputs_embeds: torch.Tensor | None,
+        aux_hidden_states: list[torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Embedding and the dense layers on the original modules; leaves the first
         MoE layer's (ar, res) in ``ars[0][:n]`` and the returned residual (zeros
@@ -186,8 +192,14 @@ class MonoDecodeRunner:
             else self.model.embed_input_ids(input_ids)
         )
         residual = None
+        if aux_hidden_states is not None:
+            self.model._maybe_add_hidden_state(aux_hidden_states, 0, hidden, residual)
         for i in range(self.n_dense):
             hidden, residual = self.model.layers[i](positions, hidden, residual)
+            if aux_hidden_states is not None:
+                self.model._maybe_add_hidden_state(
+                    aux_hidden_states, i + 1, hidden, residual
+                )
         self.ars[0][:n].copy_(hidden.view(n, HIDDEN))
         return self.res0[:n] if residual is None else residual.view(n, HIDDEN)
 
@@ -196,15 +208,27 @@ class MonoDecodeRunner:
         input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         """The final hidden states of one decode step (what the model returns)."""
-        res = self.start(input_ids, positions, inputs_embeds)
+        aux_hidden_states: list[torch.Tensor] | None = (
+            [] if self.model.aux_hidden_state_layers else None
+        )
+        res = self.start(input_ids, positions, inputs_embeds, aux_hidden_states)
         tables = self.step_tables(res.shape[0])
         for i, lw in enumerate(self.sparse):
             res = self.run_sparse_layer(i, lw, tables, positions, res)
+            if aux_hidden_states is not None:
+                self.model._maybe_add_hidden_state(
+                    aux_hidden_states,
+                    lw.layer_id + 1,
+                    self.ars[(i + 1) % 2][: res.shape[0]],
+                    res,
+                )
         hidden = self.run_final_norm(res)
         if self.timeline is not None:
             self.timeline.step_done(res.shape[0])
+        if aux_hidden_states is not None:
+            return hidden, aux_hidden_states
         return hidden
 
     def run_sparse_layer(
@@ -221,16 +245,19 @@ class MonoDecodeRunner:
         block_table, seq_lens, slots, q_len = tables
         k16, v16 = self.kv_views[lw.layer_id]
         self.k4[n](
-            _ptr(self.h), _ptr(self.q), _ptr(block_table), _ptr(seq_lens), _ptr(k16), _ptr(v16),
-            _ptr(self.kv_scale), _ptr(self.kv_scale), _ptr(lw.w_o), _ptr(lw.s_o), _ptr(lw.g_post),
-            _ptr(lw.gate), _ptr(lw.bias), _ptr(lw.w13), _ptr(lw.s13), _ptr(lw.w2), _ptr(lw.s2),
+            _ptr(self.h), _ptr(self.q), _ptr(block_table), _ptr(seq_lens),
+            _ptr(k16), _ptr(v16), _ptr(self.kv_scale), _ptr(self.kv_scale),
+            _ptr(lw.w_o), _ptr(lw.s_o), _ptr(lw.g_post),
+            _ptr(lw.gate), _ptr(lw.bias), _ptr(lw.w13), _ptr(lw.s13),
+            _ptr(lw.w2), _ptr(lw.s2),
             _ptr(lw.sh_args) if lw.shared_fp8 else 0,
-            _ptr(self.h_mids[(i + 1) % 2]), _ptr(self.ars[(i + 1) % 2]), _ptr(self.scratch4),
-            self.peers.local, _ptr(self.peers.addresses), _ptr(self.step), self.rank, lw.layer_id,
+            _ptr(self.h_mids[(i + 1) % 2]), _ptr(self.ars[(i + 1) % 2]),
+            _ptr(self.scratch4), self.peers.local, _ptr(self.peers.addresses),
+            _ptr(self.step), self.rank, lw.layer_id,
             block_table.shape[1], q_len,
             self.timeline.ptr(i) if self.timeline else 0,
             _ptr(self.k1_args[i]), _ptr(positions), _ptr(slots), _ptr(res),
-            stream=torch.cuda.current_stream(),
+            stream=torch.cuda.current_stream(),  # flydsl rejects torch.Stream
         )  # fmt: skip
         return self.h_mids[(i + 1) % 2][:n]
 
@@ -240,8 +267,9 @@ class MonoDecodeRunner:
     ) -> None:  # fmt: skip
         """Compile the layer kernels and allocate scratch, peer buffers and the
         per-step activation buffers; ``self.sparse`` and ``self.sm_scale`` are set."""
-        dev = torch.device("cuda", torch.cuda.current_device())
-        cus = torch.cuda.get_device_properties(dev).multi_processor_count
+        device_index = torch.accelerator.current_device_index()
+        dev = torch.device("cuda", device_index)
+        cus = current_platform.get_device_properties(device_index).multi_processor_count
         if cus != BLOCKS:
             raise MonoUnsupported(
                 f"{cus} CUs: the kernels need all {BLOCKS} CTAs co-resident"
@@ -295,9 +323,11 @@ class MonoDecodeRunner:
         self.k1_args = []
         for i, lw in enumerate(self.sparse):
             ptrs = {
-                "ar": _ptr(self.ars[i % 2]), "g_in": _ptr(lw.g_in), "w_qkv": _ptr(lw.w_qkv),
+                "ar": _ptr(self.ars[i % 2]), "g_in": _ptr(lw.g_in),
+                "w_qkv": _ptr(lw.w_qkv),
                 "s_qkv": _ptr(lw.s_qkv), "g_q": _ptr(lw.g_q), "g_k": _ptr(lw.g_k),
-                "g_iq": _ptr(lw.g_iq), "g_ik": _ptr(lw.g_ik), "cos_sin": _ptr(lw.cos_sin),
+                "g_iq": _ptr(lw.g_iq), "g_ik": _ptr(lw.g_ik),
+                "cos_sin": _ptr(lw.cos_sin),
                 "index_cache": _ptr(lw.index_cache), "iq_out": _ptr(self.iq),
                 "scratch": _ptr(self.scratch1),
             }  # fmt: skip

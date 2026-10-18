@@ -15,6 +15,8 @@ kernels read and the runner's device state, so a graph-mode run shows what a
 replay saw and whether the kernels ran.
 """
 
+from typing import Any, cast
+
 import torch
 
 from vllm.forward_context import ForwardContext
@@ -27,7 +29,8 @@ logger = init_logger(__name__)
 def _diff(a: torch.Tensor, b: torch.Tensor) -> str:
     a, b = a.float().flatten(), b.float().flatten()
     d = (a - b).abs()
-    return f"max {d.max().item():.3e} rel {(d.norm() / b.norm().clamp(min=1e-30)).item():.3e}"
+    rel = (d.norm() / b.norm().clamp(min=1e-30)).item()
+    return f"max {d.max().item():.3e} rel {rel:.3e}"
 
 
 def forward_checked(
@@ -35,10 +38,13 @@ def forward_checked(
     input_ids: torch.Tensor | None,
     positions: torch.Tensor,
     inputs_embeds: torch.Tensor | None,
-) -> torch.Tensor:
+) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
     """``runner.forward`` with the original decoder layer run beside every mono
     layer; the mono chain's output is returned."""
-    res = runner.start(input_ids, positions, inputs_embeds)
+    aux_hidden_states: list[torch.Tensor] | None = (
+        [] if runner.model.aux_hidden_state_layers else None
+    )
+    res = runner.start(input_ids, positions, inputs_embeds, aux_hidden_states)
     n = res.shape[0]
     tables = runner.step_tables(n)
     ars = runner.ars
@@ -48,6 +54,13 @@ def forward_checked(
         res_in = res.clone()
         res = runner.run_sparse_layer(i, lw, tables, positions, res)
         ref_h, ref_res = layer(positions, h_in, res_in)
+        if aux_hidden_states is not None:
+            runner.model._maybe_add_hidden_state(
+                aux_hidden_states,
+                lw.layer_id + 1,
+                ars[(i + 1) % 2][:n],
+                res,
+            )
         if runner.rank == 0:
             for k in range(n):
                 logger.info(
@@ -57,7 +70,10 @@ def forward_checked(
                     _diff(res[k], ref_res.view(n, HIDDEN)[k]),
                     _diff(ars[(i + 1) % 2][k], ref_h.view(n, HIDDEN)[k]),
                 )  # fmt: skip
-    return runner.run_final_norm(res)
+    hidden = runner.run_final_norm(res)
+    if aux_hidden_states is not None:
+        return hidden, aux_hidden_states
+    return hidden
 
 
 def log_step_debug(
@@ -69,9 +85,15 @@ def log_step_debug(
 ) -> None:
     if runner.rank != 0:
         return
-    md = fwd.attn_metadata.get(layer_name) if isinstance(fwd.attn_metadata, dict) else None
-    decode = md.decode if md is not None else None
-    slots = fwd.slot_mapping.get(layer_name) if isinstance(fwd.slot_mapping, dict) else None
+    md = (
+        fwd.attn_metadata.get(layer_name)
+        if isinstance(fwd.attn_metadata, dict)
+        else None
+    )
+    decode = cast(Any, md).decode if md is not None else None
+    slots = (
+        fwd.slot_mapping.get(layer_name) if isinstance(fwd.slot_mapping, dict) else None
+    )
     ptrs = {
         "pos": positions.data_ptr(),
         "emb": inputs_embeds.data_ptr() if inputs_embeds is not None else 0,

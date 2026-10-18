@@ -21,6 +21,7 @@ the f8f6f4 MFMA's fp8 A-operand order (``mxfp8_a_tiles``, the same bytes) with
 from dataclasses import dataclass
 
 import torch
+import torch.distributed as dist
 from aiter import dtypes
 from aiter.ops.quant import pertoken_quant
 from aiter.ops.shuffle import shuffle_weight
@@ -28,9 +29,7 @@ from aiter.ops.shuffle import shuffle_weight
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     dequant_mxfp8_to_bf16,
 )
-from vllm.models.minimax_m3.amd.mono.kernels.post_attn import SH_ARGS
 from vllm.models.minimax_m3.amd.mono.config import (
-    MonoUnsupported,
     HEAD_DIM,
     HIDDEN,
     INTER,
@@ -41,8 +40,11 @@ from vllm.models.minimax_m3.amd.mono.config import (
     ROTARY_DIM,
     TOP_K,
     TOPK_BLOCKS,
+    TP,
     IndexHeads,
+    MonoUnsupported,
 )
+from vllm.models.minimax_m3.amd.mono.kernels.post_attn import SH_ARGS
 
 
 def _need(ok: bool, what: str) -> None:
@@ -98,7 +100,11 @@ class SparseMoeLayer:
         """Bytes of the kernels' copy of the separate shared expert."""
         if not self.shared_fp8:
             return 0
-        return sum(t.numel() for t in (self.sh_w13, self.sh_s13, self.sh_w2, self.sh_s2))
+        nbytes = 0
+        for t in (self.sh_w13, self.sh_s13, self.sh_w2, self.sh_s2):
+            assert t is not None
+            nbytes += t.numel()
+        return nbytes
 
 
 def _ptpc_fp8_from_mxfp8(
@@ -116,6 +122,7 @@ def _ptpc_fp8_from_mxfp8(
         s is not None and tuple(s.shape) == (rows, cols // 32),
         f"{name}: scale {None if s is None else tuple(s.shape)}",
     )
+    assert w is not None and s is not None
     bf = dequant_mxfp8_to_bf16(w.data, s.data.view(torch.uint8))
     q, scale = pertoken_quant(bf, quant_dtype=dtypes.fp8)
     return (
@@ -142,6 +149,7 @@ def mxfp8_a_tiles(
         s is not None and tuple(s.shape) == (rows, cols // 32),
         f"{name}: scale {None if s is None else tuple(s.shape)}",
     )
+    assert w is not None and s is not None
     # the row-major layout the native MXFP8 linear kernel keeps; a kernel that
     # preshuffles or pads would make the tiles silently wrong
     _need(
@@ -168,6 +176,67 @@ def mxfp8_a_tiles(
     return tiles, scales
 
 
+def _ptpc_fp8_from_bf16(
+    bf: torch.Tensor, rows: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """bf16 [rows, cols] -> per-channel fp8 preshuffled (16, 16) + fp32 scale [rows]."""
+    q, scale = pertoken_quant(bf, quant_dtype=dtypes.fp8)
+    return (
+        shuffle_weight(q, layout=(16, 16)).contiguous(),
+        scale.view(rows).to(torch.float32).contiguous(),
+    )
+
+
+def _build_cp_qkv(
+    linear, rank: int, tp_group, layer_id: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The wider fused projection of indexer context parallelism: every rank's
+    index q head, all-gathered once at build time (``IndexHeads(TP, rank)``).
+
+    One rank's rows (2560): q(2048) | k(128) | v(128) | index_q(128) | index_k(128)
+    CP rows (2944):         q(2048) | k(128) | v(128) | iq_rank0..3 | index_k(128)
+
+    The gather's list order is the TP group's rank order, which ``IndexHeads.own``
+    indexes; the rank's own slot is checked against its local rows."""
+    one_rows = (LOCAL_Q_HEADS + 3 + 1) * HEAD_DIM  # 2560
+    w = getattr(linear, "weight", None)
+    s = getattr(linear, "weight_scale", None)
+    _need(
+        w is not None
+        and w.dtype == dtypes.fp8
+        and tuple(w.shape) == (one_rows, HIDDEN),
+        f"layer {layer_id} qkv_proj CP: weight "
+        f"{None if w is None else (w.dtype, tuple(w.shape))}",
+    )
+    _need(
+        s is not None and tuple(s.shape) == (one_rows, HIDDEN // 32),
+        f"layer {layer_id} qkv_proj CP: scale {None if s is None else tuple(s.shape)}",
+    )
+    assert w is not None and s is not None
+    _need(
+        dist.get_rank(tp_group) == rank and dist.get_world_size(tp_group) == TP,
+        f"layer {layer_id} qkv_proj CP: TP group rank {dist.get_rank(tp_group)}"
+        f" of {dist.get_world_size(tp_group)}, not {rank} of {TP}",
+    )
+    bf = dequant_mxfp8_to_bf16(w.data, s.data.view(torch.uint8))
+
+    iq_start = (LOCAL_Q_HEADS + 2) * HEAD_DIM  # 2304
+    iq_end = iq_start + HEAD_DIM  # 2432
+    my_iq = bf[iq_start:iq_end].contiguous()
+
+    all_iq = [torch.empty_like(my_iq) for _ in range(TP)]
+    dist.all_gather(all_iq, my_iq, group=tp_group)
+    _need(
+        torch.equal(all_iq[rank], my_iq),
+        f"layer {layer_id} qkv_proj CP: gathered index q heads not in rank order",
+    )
+
+    cp_bf = torch.cat([bf[:iq_start], *all_iq, bf[iq_end:]], dim=0)
+    cp_rows = (LOCAL_Q_HEADS + 3 + TP) * HEAD_DIM  # 2944
+    assert cp_bf.shape[0] == cp_rows, f"CP QKV rows {cp_bf.shape[0]} != {cp_rows}"
+    return _ptpc_fp8_from_bf16(cp_bf, cp_rows)
+
+
 def _cos_sin(attn, layer_id: int) -> torch.Tensor:
     t = attn.rotary_emb.cos_sin_cache
     _need(
@@ -180,17 +249,24 @@ def _cos_sin(attn, layer_id: int) -> torch.Tensor:
 
 
 def build_sparse_layer(
-    layer, layer_id: int, heads: IndexHeads = ONE_INDEX_HEAD
+    layer,
+    layer_id: int,
+    heads: IndexHeads = ONE_INDEX_HEAD,
+    rank: int = 0,
+    tp_group=None,
 ) -> SparseMoeLayer:
     attn = layer.self_attn
     _need(
         hasattr(attn, "indexer") and layer.is_moe_layer,
         f"layer {layer_id}: not sparse MoE",
     )
+    # the model has one index head per rank; under indexer context parallelism
+    # the fused projection is built wider (every rank's), see _build_cp_qkv
     _need(
         (attn.num_heads, attn.num_kv_heads, attn.num_idx_heads, attn.head_dim)
-        == (LOCAL_Q_HEADS, 1, heads.count, HEAD_DIM),
-        f"layer {layer_id}: heads {attn.num_heads}/{attn.num_kv_heads}/{attn.num_idx_heads}",
+        == (LOCAL_Q_HEADS, 1, 1, HEAD_DIM),
+        f"layer {layer_id}: heads "
+        f"{attn.num_heads}/{attn.num_kv_heads}/{attn.num_idx_heads}",
     )
     _need(attn.rotary_emb.rotary_dim == ROTARY_DIM, f"layer {layer_id}: rotary_dim")
     sel = attn.indexer.impl  # the selection config lives on the indexer impl
@@ -212,10 +288,18 @@ def build_sparse_layer(
         and index_cache.is_contiguous(),
         f"layer {layer_id}: index cache {index_cache.dtype} {tuple(index_cache.shape)}",
     )
-    w_qkv, s_qkv = _ptpc_fp8_from_mxfp8(
-        attn.qkv_proj, heads.rows, HIDDEN, f"layer {layer_id} qkv_proj"
+
+    if heads.count > 1:
+        _need(tp_group is not None, f"layer {layer_id}: CP requires tp_group")
+        w_qkv, s_qkv = _build_cp_qkv(attn.qkv_proj, rank, tp_group, layer_id)
+    else:
+        w_qkv, s_qkv = _ptpc_fp8_from_mxfp8(
+            attn.qkv_proj, heads.rows, HIDDEN, f"layer {layer_id} qkv_proj"
+        )
+
+    w_o, s_o = _ptpc_fp8_from_mxfp8(
+        attn.o_proj, HIDDEN, O_K, f"layer {layer_id} o_proj"
     )
-    w_o, s_o = _ptpc_fp8_from_mxfp8(attn.o_proj, HIDDEN, O_K, f"layer {layer_id} o_proj")
 
     moe = layer.block_sparse_moe
     # FusedMoEFactory returns a MoERunner wrapping the RoutedExperts module

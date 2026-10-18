@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Shapes the mono kernels are compiled for: one MiniMax-M3 TP4 rank.
@@ -87,7 +90,8 @@ LAYER_SLOTS = 128  # mailbox epochs: step * LAYER_SLOTS + layer + 1
 
 # host K/V cache geometry, set by the runner before the kernels are built: the
 # page-16 ids one sparse block spans (8: K and V as separate planes; 16: a block
-# interleaves K|V and V is reached from the same id at +8 pages, as vLLM lays it out) and
+# interleaves K|V and V is reached from the same id at +8 pages, as vLLM lays
+# it out) and
 # whether fp8 K/V carry the host's fixed unit scale instead of per-token scales
 KV_PAGE_STRIDE = SPARSE_BLOCK // PAGE16
 STATIC_KV_SCALE = False
