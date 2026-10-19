@@ -91,6 +91,10 @@ from vllm.models.minimax_m3.amd.indexer_aiter import (
     MiniMaxM3AiterIndexer,
     select_aiter_indexer_impl_cls,
 )
+from vllm.models.minimax_m3.amd.indexer_nvfp4 import (
+    MiniMaxM3IndexerRocmNvfp4Impl,
+    init_rocm_nvfp4_indexer_decode_cp,
+)
 from vllm.models.minimax_m3.amd.mono.envs import envs as mono_envs
 from vllm.models.minimax_m3.amd.ops import (
     gemma_fused_add_rmsnorm,
@@ -110,7 +114,10 @@ from vllm.models.minimax_m3.amd.sparse_attention_msa import (
 from vllm.models.minimax_m3.common.encoder_cudagraph import (
     MiniMaxM3EncoderCudaGraphMixin,
 )
-from vllm.models.minimax_m3.common.indexer import MiniMaxM3Indexer
+from vllm.models.minimax_m3.common.indexer import (
+    MiniMaxM3Indexer,
+    MiniMaxM3IndexerImpl,
+)
 from vllm.models.minimax_m3.common.mm_preprocess import (
     MiniMaxM3VLDummyInputsBuilder,
     MiniMaxM3VLMultiModalProcessor,
@@ -743,23 +750,39 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         # Shared top-k buffer: the indexer writes the selected blocks into it and
         # the attend impl reads them back (no Python value crosses the break).
         self.topk_indices_buffer = topk_indices_buffer
+        # NVFP4 main K/V: the FlyDSL NVFP4 attend and indexer
+        # (sparse_attention_nvfp4.py, indexer_nvfp4.py). One fused kernel
+        # inserts both caches, so the index cache is NVFP4 too.
+        self.use_nvfp4_kv = get_kv_quant_mode(self.kv_cache_dtype).is_nvfp4
         # Indexer and main attention are separate impls. The AITER indexer is
         # ROCm-only, so it is selected here rather than inside the neutral
         # MiniMaxM3Indexer, which knows nothing about it and would pick Triton.
-        indexer_impl_cls = select_aiter_indexer_impl_cls(
-            topk_blocks=sparse_cfg["sparse_topk_blocks"],
-            sparse_block_size=sparse_cfg["sparse_block_size"],
-            num_index_heads=self.num_idx_heads,
-            index_head_dim=self.idx_head_dim,
-            indexer_kv_dtype=self.indexer_kv_dtype,
-            score_type=sparse_cfg.get("sparse_score_type", "max"),
-        )
+        indexer_impl_cls: type[MiniMaxM3IndexerImpl] | None
+        if self.use_nvfp4_kv:
+            if self.indexer_kv_dtype != "nvfp4":
+                raise ValueError(
+                    "MiniMax M3 with an NVFP4 KV cache on ROCm needs the NVFP4 "
+                    "index cache (attention_config.indexer_kv_dtype='nvfp4'), "
+                    f"got {self.indexer_kv_dtype!r}"
+                )
+            indexer_impl_cls = MiniMaxM3IndexerRocmNvfp4Impl
+        else:
+            indexer_impl_cls = select_aiter_indexer_impl_cls(
+                topk_blocks=sparse_cfg["sparse_topk_blocks"],
+                sparse_block_size=sparse_cfg["sparse_block_size"],
+                num_index_heads=self.num_idx_heads,
+                index_head_dim=self.idx_head_dim,
+                indexer_kv_dtype=self.indexer_kv_dtype,
+                score_type=sparse_cfg.get("sparse_score_type", "max"),
+            )
         # The attend gate below needs this: an emitted table is what lets it
         # serve more than one KV head per rank. Buffers to write the table into
         # only arrive when the model already resolved the attend to the AITER
         # path the table addresses, so that is not rechecked here.
         self.indexer_emits_table = (
-            indexer_impl_cls is not None and sparse_table_buffers is not None
+            not self.use_nvfp4_kv
+            and indexer_impl_cls is not None
+            and sparse_table_buffers is not None
         )
         # The backend names the metadata builder, which for the AITER path is
         # the one that rebases the block table the indexer's top-k resolves
@@ -780,8 +803,10 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             topk_blocks=sparse_cfg["sparse_topk_blocks"],
             sparse_block_size=sparse_cfg["sparse_block_size"],
         )
-        self.use_aiter_sparse_pa = minimax_m3_use_aiter_sparse_pa(
-            self.num_kv_heads, emits_sparse_block_table=self.indexer_emits_table
+        self.use_aiter_sparse_pa = not self.use_nvfp4_kv and (
+            minimax_m3_use_aiter_sparse_pa(
+                self.num_kv_heads, emits_sparse_block_table=self.indexer_emits_table
+            )
         )
         self.kv_cache_k = torch.tensor([])
         self.kv_cache_v = torch.tensor([])
@@ -970,6 +995,49 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             return
         minimax_m3_insert_index_cache(index_k, index_cache, index_slot_mapping)
 
+    def _norm_rope_nvfp4_insert(
+        self,
+        qkv: torch.Tensor,
+        positions: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        index_slot_mapping: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """q/k/index-q/index-k Gemma norm + RoPE, and the NVFP4 K/V and index-K
+        inserts, in one FlyDSL launch (``ops/norm_rope_nvfp4_insert``). Returns
+        the bf16 q and the e4m3 index-q."""
+        from vllm.models.minimax_m3.amd.ops.norm_rope_nvfp4_insert import (
+            minimax_m3_norm_rope_nvfp4_insert,
+        )
+
+        num_tokens = qkv.shape[0]
+        q = qkv.new_empty((num_tokens, self.q_size))
+        index_q = qkv.new_empty(
+            (num_tokens, self.index_q_size),
+            dtype=self.indexer.index_cache.query_dtype,
+        )
+        minimax_m3_norm_rope_nvfp4_insert(
+            qkv,
+            self.q_norm.weight,
+            self.k_norm.weight,
+            self.index_q_norm.weight,
+            self.index_k_norm.weight,
+            self.rotary_emb.cos_sin_cache,
+            positions,
+            slot_mapping,
+            index_slot_mapping,
+            self.kv_cache,
+            self.indexer.index_cache.kv_cache,
+            self._k_scale,
+            self._v_scale,
+            q,
+            index_q,
+            num_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+            num_index_heads=self.num_idx_heads,
+            eps=self.q_norm.variance_epsilon,
+        )
+        return q, index_q
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -1000,6 +1068,19 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             return qkv.new_zeros((num_tokens, self.hidden_size))
 
         main_slot_mapping = fwd_slot_mapping[self.layer_name]
+        if self.use_nvfp4_kv:
+            q, index_q = self._norm_rope_nvfp4_insert(
+                qkv,
+                positions,
+                main_slot_mapping,
+                fwd_slot_mapping[self.indexer.index_cache.prefix],
+            )
+            output = torch.empty_like(q)
+            attn_output = self._run_attention(
+                q, None if self.skip_index_topk else index_q, output
+            )
+            output, _ = self.o_proj(attn_output)
+            return output
         q = qkv.new_empty((num_tokens, self.q_size))
         key_cache = value_cache = page16_slot_mapping = None
         k_scale = v_scale = None
@@ -1419,7 +1500,10 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
             # num_idx_heads from num_kv_heads, not from sparse_num_index_heads),
             # so this cannot land on the other side of the MFMA column limit
             # from the selection the layer makes.
-            emits_table = (
+            use_nvfp4_kv = get_kv_quant_mode(
+                vllm_config.cache_config.cache_dtype
+            ).is_nvfp4
+            emits_table = not use_nvfp4_kv and (
                 select_aiter_indexer_impl_cls(
                     topk_blocks=sparse_cfg["sparse_topk_blocks"],
                     sparse_block_size=sparse_cfg["sparse_block_size"],
@@ -1444,6 +1528,12 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
                         dtype=torch.int32,
                     ),
                     torch.empty(rows, dtype=torch.int32),
+                )
+            if use_nvfp4_kv:
+                # Collective over the TP group (IPC buffers): every rank builds
+                # the model at the same point, outside graph capture.
+                init_rocm_nvfp4_indexer_decode_cp(
+                    vllm_config.model_config.max_model_len
                 )
         else:
             self.topk_indices_buffer = None

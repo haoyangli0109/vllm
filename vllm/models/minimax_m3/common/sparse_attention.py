@@ -534,9 +534,21 @@ def select_main_backend_and_impl_cls(
     Blackwell (SM100) uses the MSA attend for supported top-k block counts
     when the KV cache is BF16, FP8 E4M3 or NVFP4; MI355 uses AITER sparse PA
     with shuffle KV cache layout; Other platforms and FP8 E5M2 fall
-    back to Triton. NVFP4 is MSA-only. The MSA modules are imported lazily to
-    avoid import errors on unsupported platforms.
+    back to Triton. NVFP4 is served by MSA on SM100 and by the FlyDSL NVFP4
+    attend on ROCm gfx950 (amd/sparse_attention_nvfp4.py). The MSA modules are
+    imported lazily to avoid import errors on unsupported platforms.
     """
+    if current_platform.is_rocm() and kv_cache_dtype == "nvfp4":
+        from vllm.models.minimax_m3.amd.sparse_attention_nvfp4 import (
+            MiniMaxM3SparseRocmNvfp4Backend,
+            MiniMaxM3SparseRocmNvfp4Impl,
+        )
+
+        logger.info_once(
+            "MiniMax M3 sparse attention selected ROCm NVFP4 (topk_blocks=%s)",
+            topk_blocks,
+        )
+        return MiniMaxM3SparseRocmNvfp4Backend, MiniMaxM3SparseRocmNvfp4Impl
     use_aiter_sparse_pa = minimax_m3_use_aiter_sparse_pa(
         num_kv_heads, emits_sparse_block_table=emits_sparse_block_table
     )
@@ -555,8 +567,8 @@ def select_main_backend_and_impl_cls(
     if use_nvfp4 and (use_aiter_sparse_pa or not use_msa):
         raise ValueError(
             "MiniMax M3 sparse attention supports an NVFP4 KV cache only with "
-            f"the SM100 MSA backend (kv_cache_dtype={kv_cache_dtype}, "
-            f"topk_blocks={topk_blocks})"
+            "the SM100 MSA backend or on ROCm gfx950 "
+            f"(kv_cache_dtype={kv_cache_dtype}, topk_blocks={topk_blocks})"
         )
     selected = (
         "AITER_SPARSE_PA" if use_aiter_sparse_pa else ("MSA" if use_msa else "Triton")

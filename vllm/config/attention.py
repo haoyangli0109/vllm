@@ -97,7 +97,8 @@ class AttentionConfig:
     model's default (bf16 for MiniMax M3, fp8 for the DeepSeek sparse
     indexer). Quantized formats (fp8, mxfp4, nvfp4) require indexer kernel
     support in the backend; MiniMax M3 supports nvfp4 on SM100/SM103/SM107 with at
-    most 8 decode queries per request."""
+    most 8 decode queries per request, and on ROCm gfx950 together with the nvfp4
+    KV cache."""
 
     indexer_decode_cp: bool = False
     """Split the sparse-attention indexer's decode scoring across the
@@ -109,7 +110,9 @@ class AttentionConfig:
     cannot be combined. Implemented for the MiniMax M3 NVFP4 indexer, which
     needs `indexer_kv_dtype="nvfp4"` and TP 4 (one index head per rank); it is
     ignored with a warning where it does not apply. It pays off from about 4
-    concurrent decodes at 128K context and grows with batch and context."""
+    concurrent decodes at 128K context and grows with batch and context. On ROCm
+    gfx950 it applies to decode steps of 4 query tokens per request (DSpark 3)
+    and at most 256 requests; other steps score locally."""
 
     indexer_sparse_logits: bool = False
     """DeepSeek V4.1 two-level indexer: score only the candidate blocks with

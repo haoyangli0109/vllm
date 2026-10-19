@@ -228,6 +228,8 @@ inverse_std_variences = "inverse_std_variences"
 
 [tool.typos.default.extend-words]
 MoNE = "MoNE"
+# AMDGPU buffer_load addressing mode (inline asm)
+offen = "offen"
 mone = "mone"
 Hel = "Hel"
 wether = "wether"
