@@ -8,18 +8,10 @@ the mono layer kernel, then the original decoder layer. Both insert the same cac
 slots (the kernel writes the same bytes up to the re-quantized attention weights),
 so running both is side-effect free. Rank 0 logs, per layer and token, the
 difference of the residual stream and of the reduced MoE output.
-
-``log_step_debug`` (``VLLM_ROCM_MINIMAX_M3_MONO_DEBUG=1``) logs, on every step
-that reaches Python (capture passes and non-replayed steps), the addresses the
-kernels read and the runner's device state, so a graph-mode run shows what a
-replay saw and whether the kernels ran.
 """
-
-from typing import Any, cast
 
 import torch
 
-from vllm.forward_context import ForwardContext
 from vllm.logger import init_logger
 from vllm.models.minimax_m3.amd.mono.config import HIDDEN
 
@@ -74,42 +66,3 @@ def forward_checked(
     if aux_hidden_states is not None:
         return hidden, aux_hidden_states
     return hidden
-
-
-def log_step_debug(
-    runner,
-    fwd: ForwardContext,
-    layer_name: str,
-    positions: torch.Tensor,
-    inputs_embeds: torch.Tensor | None,
-) -> None:
-    if runner.rank != 0:
-        return
-    md = (
-        fwd.attn_metadata.get(layer_name)
-        if isinstance(fwd.attn_metadata, dict)
-        else None
-    )
-    decode = cast(Any, md).decode if md is not None else None
-    slots = (
-        fwd.slot_mapping.get(layer_name) if isinstance(fwd.slot_mapping, dict) else None
-    )
-    ptrs = {
-        "pos": positions.data_ptr(),
-        "emb": inputs_embeds.data_ptr() if inputs_embeds is not None else 0,
-        "bt": decode.block_table.data_ptr() if decode is not None else 0,
-        "sl": decode.seq_lens.data_ptr() if decode is not None else 0,
-        "slots": slots.data_ptr() if slots is not None else 0,
-    }
-    capturing = torch.cuda.is_current_stream_capturing()
-    state = (
-        "(capturing)"  # no device sync inside a capture
-        if capturing
-        else f"step={int(runner.step.item())} "
-        f"ars1={runner.ars[1][0, :3].float().tolist()} "
-        f"hmid1={runner.h_mids[1][0, :3].float().tolist()}"
-    )
-    logger.info(
-        "mono debug n=%d capturing=%s ptrs=%s %s",
-        positions.numel(), capturing, {k: hex(v) for k, v in ptrs.items()}, state,
-    )  # fmt: skip

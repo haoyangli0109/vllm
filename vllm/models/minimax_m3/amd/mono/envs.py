@@ -10,10 +10,11 @@ def _flag(name: str) -> bool:
 
 
 class _Envs:
+    # route supported decode steps to the mono kernels
     MONO_ENABLE = _flag("VLLM_ROCM_MINIMAX_M3_MONO")
+    # run every sparse layer twice (kernels, then the original modules) and log the
+    # per-token differences; the layer-parity self-check, meant for --enforce-eager
     MONO_CHECK = _flag("VLLM_ROCM_MINIMAX_M3_MONO_CHECK")
-    MONO_DEBUG = _flag("VLLM_ROCM_MINIMAX_M3_MONO_DEBUG")
-    MONO_TIMELINE = os.getenv("VLLM_ROCM_MINIMAX_M3_MONO_TIMELINE") or None
 
 
 envs = _Envs()

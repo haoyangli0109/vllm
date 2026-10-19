@@ -37,7 +37,6 @@ from vllm.models.minimax_m3.amd.mono.config import (
     IndexHeads,
     MonoUnsupported,
 )
-from vllm.models.minimax_m3.amd.mono.envs import envs
 from vllm.models.minimax_m3.amd.mono.kernels.post_attn import build_post_attn_kernel
 from vllm.models.minimax_m3.amd.mono.kernels.pre_attn import K1_ARGS
 from vllm.models.minimax_m3.amd.mono.kernels.pre_attn import (
@@ -46,7 +45,6 @@ from vllm.models.minimax_m3.amd.mono.kernels.pre_attn import (
 from vllm.models.minimax_m3.amd.mono.layout import SCRATCH_BYTES as K4_SCRATCH_BYTES
 from vllm.models.minimax_m3.amd.mono.layout import sym_layout
 from vllm.models.minimax_m3.amd.mono.peer_buffer import PeerBuffer
-from vllm.models.minimax_m3.amd.mono.timeline import LayerTimeline
 from vllm.models.minimax_m3.amd.mono.weights import SparseMoeLayer, build_sparse_layer
 from vllm.platforms import current_platform
 
@@ -225,8 +223,6 @@ class MonoDecodeRunner:
                     res,
                 )
         hidden = self.run_final_norm(res)
-        if self.timeline is not None:
-            self.timeline.step_done(res.shape[0])
         if aux_hidden_states is not None:
             return hidden, aux_hidden_states
         return hidden
@@ -255,7 +251,7 @@ class MonoDecodeRunner:
             _ptr(self.scratch4), self.peers.local, _ptr(self.peers.addresses),
             _ptr(self.step), self.rank, lw.layer_id,
             block_table.shape[1], q_len,
-            self.timeline.ptr(i) if self.timeline else 0,
+            0,  # timeline stamps (kernel debug build only)
             _ptr(self.k1_args[i]), _ptr(positions), _ptr(slots), _ptr(res),
             stream=torch.cuda.current_stream(),  # flydsl rejects torch.Stream
         )  # fmt: skip
@@ -274,12 +270,6 @@ class MonoDecodeRunner:
             raise MonoUnsupported(
                 f"{cus} CUs: the kernels need all {BLOCKS} CTAs co-resident"
             )
-        tl_prefix = envs.MONO_TIMELINE
-        self.timeline = (
-            LayerTimeline(tl_prefix, len(self.sparse), self.rank, dev)
-            if tl_prefix
-            else None
-        )
         # one layer kernel per decode batch size (every graph captures its own)
         self.k4 = {
             s: build_post_attn_kernel(
@@ -293,7 +283,6 @@ class MonoDecodeRunner:
                 local_blocks,
                 s,
                 fuse_k1=True,
-                timeline=self.timeline is not None,
                 heads=heads,
                 shared_fp8=self.shared_fp8,
             )

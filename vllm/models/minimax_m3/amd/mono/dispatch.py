@@ -21,7 +21,7 @@ import torch
 from vllm.config import VllmConfig
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
-from vllm.models.minimax_m3.amd.mono.check import forward_checked, log_step_debug
+from vllm.models.minimax_m3.amd.mono.check import forward_checked
 from vllm.models.minimax_m3.amd.mono.config import (
     MAX_CONTEXT,
     MAX_TOKENS,
@@ -200,37 +200,9 @@ class MonoDecode:
             return False
         fwd = get_forward_context()
         n = positions.numel()
-        if envs.MONO_DEBUG and self._runner is not None:
-            log_step_debug(
-                self._runner, fwd, self._layer_name, positions, inputs_embeds
-            )
-        why = _step_refusal(fwd, self._layer_name, n, positions)
-        if why is not None:
-            if envs.MONO_DEBUG:
-                self._count_refusal(why, fwd, n)
+        if _step_refusal(fwd, self._layer_name, n, positions) is not None:
             return False
         return self._ensure_runner() and self._slots_shared(fwd, n)
-
-    def _count_refusal(self, why: str, fwd: ForwardContext, n: int) -> None:
-        """MONO_DEBUG: tally why steps stay on the original path (rank 0 logs
-        every 100 declined steps)."""
-        md = cast(
-            Any,
-            fwd.attn_metadata.get(self._layer_name)
-            if isinstance(fwd.attn_metadata, dict)
-            else None,
-        )
-        summary = (
-            f"{why} [n={n} prefills={md.num_prefills} "
-            f"decode_tokens={md.num_decode_tokens}]"
-            if md is not None
-            else why
-        )
-        counts = self.__dict__.setdefault("_refusals", {})
-        counts[summary] = counts.get(summary, 0) + 1
-        total = sum(counts.values())
-        if total % 100 == 0 and (self._runner is None or self._runner.rank == 0):
-            logger.info("mono declined %d steps so far: %s", total, counts)
 
     def forward(
         self,

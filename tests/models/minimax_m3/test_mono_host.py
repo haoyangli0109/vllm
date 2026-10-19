@@ -14,6 +14,8 @@ import torch
 pytest.importorskip("flydsl")
 
 from vllm.models.minimax_m3.amd.mono import config as mono_config  # noqa: E402
+from vllm.models.minimax_m3.amd.mono import dispatch as mono_dispatch  # noqa: E402
+from vllm.models.minimax_m3.amd.mono import envs as mono_envs  # noqa: E402
 from vllm.models.minimax_m3.amd.mono.config import (  # noqa: E402
     MAX_CONTEXT,
     MAX_TOKENS,
@@ -32,7 +34,14 @@ from vllm.models.minimax_m3.amd.mono.runner import (  # noqa: E402
 
 
 def _layer(moe: bool, sparse: bool):
-    attn = SimpleNamespace(indexer=object()) if sparse else SimpleNamespace()
+    attn = (
+        SimpleNamespace(
+            layer_name="attn",
+            indexer=SimpleNamespace(index_cache=SimpleNamespace(prefix="idx")),
+        )
+        if sparse
+        else SimpleNamespace()
+    )
     return SimpleNamespace(is_moe_layer=moe, self_attn=attn)
 
 
@@ -101,7 +110,9 @@ def _vllm_config(**overrides):
         ),
         cache_config=SimpleNamespace(cache_dtype="fp8", block_size=SPARSE_BLOCK),
         compilation_config=SimpleNamespace(cudagraph_mode=cg),
-        model_config=SimpleNamespace(max_model_len=32768),
+        model_config=SimpleNamespace(
+            max_model_len=32768, hf_text_config=SimpleNamespace()
+        ),
         attention_config=SimpleNamespace(
             resolve_indexer_kv_dtype=lambda default: "fp8"
         ),
@@ -182,3 +193,157 @@ def test_step_refusal_rejects_what_the_kernels_cannot_serve():
         "attn"
     ].decode.block_table.t()
     assert "contiguous" in _step_refusal(fwd, "attn", 4, pos)
+
+
+# ---- MonoDecode host contract: enable, runner life cycle, slot check, routing ----
+# Everything the kernels are not: these pin the dispatcher's behaviour so a refactor
+# of the host side (or of the switch) must keep passing them.
+
+
+class _FakeRunner:
+    built = 0
+
+    def __init__(self, model, config, *, stale=False, fp8=False):
+        _FakeRunner.built += 1
+        self._stale = stale
+        self.shared_fp8 = fp8
+        self.sparse = []
+        self.rank = 0
+        self.closed = False
+        self.calls = []
+
+    def stale(self):
+        return self._stale
+
+    def close(self):
+        self.closed = True
+
+    def forward(self, input_ids, positions, inputs_embeds):
+        self.calls.append(positions.numel())
+        return "mono-out"
+
+
+@pytest.fixture
+def mono(monkeypatch):
+    """An enabled dispatcher on a supported deployment, outside graph capture,
+    with the runner build stubbed."""
+    monkeypatch.setattr(mono_dispatch.envs, "MONO_ENABLE", True)
+    monkeypatch.setattr(mono_dispatch.envs, "MONO_CHECK", False)
+    monkeypatch.setattr(mono_dispatch, "MonoDecodeRunner", _FakeRunner)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    _FakeRunner.built = 0
+    return mono_dispatch.MonoDecode(_model(), _vllm_config())
+
+
+def _fwd_shared(n: int, shared: bool = True):
+    fwd = _fwd(n)
+    slots = fwd.slot_mapping["attn"]
+    fwd.slot_mapping["idx"] = slots.clone() if shared else slots + 1
+    return fwd
+
+
+def test_env_flag_parsing(monkeypatch):
+    for raw, want in (("1", True), ("true", True), ("True", True), ("0", False)):
+        monkeypatch.setenv("VLLM_ROCM_MINIMAX_M3_MONO_TESTFLAG", raw)
+        assert mono_envs._flag("VLLM_ROCM_MINIMAX_M3_MONO_TESTFLAG") is want
+    monkeypatch.delenv("VLLM_ROCM_MINIMAX_M3_MONO_TESTFLAG")
+    assert mono_envs._flag("VLLM_ROCM_MINIMAX_M3_MONO_TESTFLAG") is False
+
+
+def test_disabled_without_the_switch(monkeypatch):
+    monkeypatch.setattr(mono_dispatch.envs, "MONO_ENABLE", False)
+    mono = mono_dispatch.MonoDecode(_model(), _vllm_config())
+    assert not mono._enabled
+    assert not mono.supports(None, torch.zeros(1, dtype=torch.int64), None, None)
+
+
+def test_unsupported_deployment_falls_back(monkeypatch):
+    monkeypatch.setattr(mono_dispatch.envs, "MONO_ENABLE", True)
+    bad = _vllm_config(**{"parallel_config.tensor_parallel_size": 8})
+    assert not mono_dispatch.MonoDecode(_model(), bad)._enabled
+
+
+def test_enabled_dispatcher_reads_the_first_sparse_layer(mono):
+    assert mono._enabled
+    assert mono._layer_name == "attn" and mono._index_prefix == "idx"
+    assert mono._runner is None  # built lazily, on the first eligible step
+
+
+def test_runner_is_built_once_outside_capture(mono):
+    assert mono._ensure_runner() and _FakeRunner.built == 1
+    assert mono._ensure_runner() and _FakeRunner.built == 1
+
+
+def test_runner_is_not_built_inside_capture(mono, monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    assert not mono._ensure_runner() and _FakeRunner.built == 0
+    assert mono._enabled  # not a refusal: the next uncaptured step builds it
+
+
+def test_stale_runner_is_rebuilt_after_a_kv_rebind(mono, monkeypatch):
+    first = _FakeRunner(None, None, stale=True)
+    mono._runner, mono._slots_verified = first, True
+    assert mono._ensure_runner()
+    assert first.closed and mono._runner is not first
+    assert not mono._slots_verified  # the new cache's slots are checked again
+
+
+def test_stale_runner_is_kept_while_capturing(mono, monkeypatch):
+    first = _FakeRunner(None, None, stale=True)
+    mono._runner = first
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    assert not mono._ensure_runner() and not first.closed
+
+
+@pytest.mark.parametrize("exc", [MonoUnsupported("no CUs"), RuntimeError("boom")])
+def test_runner_build_failure_disables_mono(mono, monkeypatch, exc):
+    def boom(model, config):
+        raise exc
+
+    monkeypatch.setattr(mono_dispatch, "MonoDecodeRunner", boom)
+    assert not mono._ensure_runner()
+    assert not mono._enabled and mono._runner is None
+
+
+def test_slot_check_runs_once_and_caches(mono):
+    assert mono._slots_shared(_fwd_shared(4), 4) and mono._slots_verified
+    assert mono._slots_shared(_fwd_shared(4, shared=False), 4)  # cached verdict
+
+
+@pytest.mark.parametrize("missing", [True, False])
+def test_unshared_index_slots_disable_mono(mono, missing):
+    fwd = _fwd_shared(4, shared=False)  # mismatched ids ...
+    if missing:
+        del fwd.slot_mapping["idx"]  # ... or no index slots at all
+    assert not mono._slots_shared(fwd, 4) and not mono._enabled
+
+
+def test_supports_routes_only_pure_decodes(mono, monkeypatch):
+    pos = torch.zeros(4, dtype=torch.int64)
+    monkeypatch.setattr(mono_dispatch, "get_forward_context", lambda: _fwd_shared(4))
+    assert mono.supports(None, pos, None, None) and _FakeRunner.built == 1
+    assert not mono.supports(None, pos, object(), None)  # pipeline-parallel input
+    monkeypatch.setattr(
+        mono_dispatch, "get_forward_context", lambda: _fwd_shared(4, shared=True)
+    )
+    fwd = _fwd(4, prefills=1)
+    monkeypatch.setattr(mono_dispatch, "get_forward_context", lambda: fwd)
+    assert not mono.supports(None, pos, None, None) and mono._enabled  # just declined
+
+
+def test_refused_step_does_not_build_the_runner(mono, monkeypatch):
+    fwd = _fwd(MAX_TOKENS + 1)
+    monkeypatch.setattr(mono_dispatch, "get_forward_context", lambda: fwd)
+    pos = torch.zeros(MAX_TOKENS + 1, dtype=torch.int64)
+    assert not mono.supports(None, pos, None, None) and _FakeRunner.built == 0
+
+
+def test_forward_runs_the_runner_or_the_self_check(mono, monkeypatch):
+    mono._ensure_runner()
+    pos = torch.zeros(2, dtype=torch.int64)
+    assert mono.forward(None, pos, None) == "mono-out" and mono._runner.calls == [2]
+    monkeypatch.setattr(mono_dispatch.envs, "MONO_CHECK", True)
+    monkeypatch.setattr(
+        mono_dispatch, "forward_checked", lambda runner, *a: ("checked", runner)
+    )
+    assert mono.forward(None, pos, None) == ("checked", mono._runner)
