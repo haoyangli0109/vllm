@@ -1,0 +1,26 @@
+steps:
+  - label: ":pipeline: Generate MiniMax-M3.1 PR CI"
+    key: minimax-m31-generate
+    command: |
+      set -euo pipefail
+      ci_dir="$(mktemp -d)"
+      trap 'rm -rf "$$ci_dir" minimax-m31-ci.tar.gz' EXIT
+      ci_ref="$${MINIMAX_M31_CI_REF:-nho_tracking}"
+      if [[ ! "$$ci_ref" =~ ^[A-Za-z0-9._/-]+$ ]] ||
+         [[ "$$ci_ref" == *..* ]] ||
+         [[ "$$ci_ref" == *//* ]] ||
+         ! git check-ref-format --branch "$$ci_ref" >/dev/null 2>&1; then
+        echo "ERROR: MINIMAX_M31_CI_REF is not a safe Git branch name" >&2
+        exit 1
+      fi
+      git fetch --no-tags origin "$$ci_ref"
+      git archive --format=tar FETCH_HEAD .buildkite/minimax-m31 |
+        tar -xf - -C "$$ci_dir"
+      "$$ci_dir/.buildkite/minimax-m31/package-deps.sh" "$$ci_dir"
+      tar -C "$$ci_dir" -czf minimax-m31-ci.tar.gz .buildkite/minimax-m31 deps
+      buildkite-agent artifact upload minimax-m31-ci.tar.gz
+      "$$ci_dir/.buildkite/minimax-m31/generate-pipeline.sh" |
+        buildkite-agent pipeline upload
+    agents:
+      queue: small_cpu_premerge
+    timeout_in_minutes: 10

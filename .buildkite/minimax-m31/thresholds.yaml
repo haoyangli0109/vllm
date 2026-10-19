@@ -1,0 +1,14 @@
+# Minimum scores for m31-tp4-ci.yaml; the CI job fails below any of them.
+# Keys are mqa task and metric names. Two runs on 4x B300 with
+# Inferact/Minimax-M3-NVFP4@9333bb65 (Buildkite builds 3 and 4):
+#   gpqa_diamond exact_match (avg@4)    0.8674  0.8775
+#   aime25       exact_match (avg@16)   0.7583  0.7792
+#   MMMUPro      strict-match           0.7630  0.7705
+# pass@k is not gated: GPQA is 4-way multiple choice, so pass@4 stays high
+# even for a weak model.
+gpqa_diamond:
+  exact_match: 0.83
+aime25:
+  exact_match: 0.70
+MMMUPro:
+  strict-match: 0.73
