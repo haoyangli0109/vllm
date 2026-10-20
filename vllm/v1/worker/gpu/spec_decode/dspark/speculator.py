@@ -76,6 +76,10 @@ class DSparkSpeculator(DFlashSpeculator):
             torch.arange(self.max_num_reqs, dtype=torch.int64, device=device)
             * self.num_query_per_req
         )
+        # The replicated Markov loop samples every row of its bias.
+        self._req_rows = torch.arange(
+            self.max_num_reqs, dtype=torch.int64, device=device
+        )
 
         # Reduced-vocab probabilistic drafting only; set in load_draft_model.
         self._d2t_scatter_index: torch.Tensor | None = None
@@ -191,6 +195,44 @@ class DSparkSpeculator(DFlashSpeculator):
             use_fp64=self.use_fp64_gumbel,
         )
 
+    def _sample_markov_step(
+        self,
+        step: int,
+        logits: torch.Tensor,
+        bias: torch.Tensor,
+        bias_rows: torch.Tensor,
+        idx_map: torch.Tensor,
+        draw_pos: torch.Tensor,
+    ) -> torch.Tensor:
+        """Draft ids of step `step`, sampled from `logits + bias[bias_rows]`."""
+        # Greedy drafting, a reduced draft vocab, watermarking and the acceptance
+        # estimator need the biased logits; otherwise the Gumbel kernel adds the
+        # bias itself.
+        if (
+            self.draft_logits is None
+            or self._d2t_scatter_index is not None
+            or self.draft_watermarker is not None
+            or self.acceptance_estimator is not None
+        ):
+            # _sample_logits takes the predicted position P.
+            return self._sample_logits(
+                logits + bias[bias_rows], idx_map, draw_pos + 1, step
+            )
+        return gumbel_sample(
+            logits,
+            idx_map,
+            self.temperature,
+            self.seeds,
+            draw_pos,
+            apply_temperature=True,
+            is_drafting=True,
+            logits_cache=self.draft_logits,
+            logits_cache_col=self._step_cols[step],
+            use_fp64=self.use_fp64_gumbel,
+            bias=bias,
+            bias_rows=bias_rows,
+        )
+
     def _sample_sequential(self, num_reqs: int, head_hidden: torch.Tensor) -> None:
         if self._draft_topk is not None:
             self._sample_sequential_topk(num_reqs, head_hidden)
@@ -208,7 +250,13 @@ class DSparkSpeculator(DFlashSpeculator):
 
         idx_map = self.sample_idx_mapping[:num_sample].view(num_reqs, n_spec)
         sample_pos = self.sample_pos[:num_sample].view(num_reqs, n_spec)
+        # Step-major, so every step reads contiguous rows. Draws are keyed by
+        # the position before the sampled token, P-1.
+        idx_map_steps = idx_map.t().contiguous()
+        draw_pos_steps = (sample_pos.t() - 1).contiguous()
+        bias_rows = self._req_rows[:num_reqs]
         confidence_markov_embeds = []
+        draft_ids = []
 
         # Anchor (bonus) token per request = the input id at query offset 0,
         # read via the precomputed persistent index (fixed buffer for capture).
@@ -220,12 +268,16 @@ class DSparkSpeculator(DFlashSpeculator):
             if self.use_confidence_head:
                 confidence_markov_embeds.append(markov_embed)
             bias = self.model.markov_bias(markov_embed)
-            logits_i = base_logits[:, i] + bias
-            draft_sampled_i = self._sample_logits(
-                logits_i, idx_map[:, i], sample_pos[:, i], i
+            prev = self._sample_markov_step(
+                i,
+                base_logits[:, i],
+                bias,
+                bias_rows,
+                idx_map_steps[i],
+                draw_pos_steps[i],
             )
-            self.draft_tokens[:num_reqs, i] = draft_sampled_i
-            prev = draft_sampled_i
+            draft_ids.append(prev)
+        torch.stack(draft_ids, dim=1, out=self.draft_tokens[:num_reqs])
 
         if self.use_confidence_head:
             confidence = self.model.compute_confidence(
@@ -338,37 +390,19 @@ class DSparkSpeculator(DFlashSpeculator):
         local_rows = sharder.local_rows[:num_local_reqs]
         idx_map = sharder.local_idx_mapping[:, :num_local_reqs]
         sample_pos = sharder.local_sample_pos[:, :num_local_reqs]
-        # The Gumbel kernel adds the bias rows itself (probabilistic drafting).
-        fused = self.draft_logits is not None and self._d2t_scatter_index is None
-        if fused:
-            # sample_pos is the predicted position; draws are keyed by P-1.
-            draw_pos = sample_pos - 1
+        # sample_pos is the predicted position; draws are keyed by P-1.
+        draw_pos = sample_pos - 1
 
         # The Markov bias keeps all num_reqs rows, so it runs the GEMM (and
         # gets the bits) of the replicated path; other ranks' rows are unused.
         prev = self.input_buffers.input_ids[self._anchor_idx[:num_reqs]].long()
+        draft_ids = []
         for i in range(n_spec):
             bias = self.model.markov_bias(self.model.markov_embed(prev))
-            if fused and bias.dtype == base_logits.dtype:
-                draft_sampled_i = gumbel_sample(
-                    base_logits[:, i],
-                    idx_map[i],
-                    self.temperature,
-                    self.seeds,
-                    draw_pos[i],
-                    apply_temperature=True,
-                    is_drafting=True,
-                    logits_cache=self.draft_logits,
-                    logits_cache_col=self._step_cols[i],
-                    use_fp64=self.use_fp64_gumbel,
-                    bias=bias,
-                    bias_rows=local_rows,
-                )
-            else:
-                logits_i = base_logits[:, i] + bias[local_rows]
-                draft_sampled_i = self._sample_logits(
-                    logits_i, idx_map[i], sample_pos[i], i
-                )
-            sharder.local_draft_ids[:num_local_reqs, i] = draft_sampled_i
+            draft_sampled_i = self._sample_markov_step(
+                i, base_logits[:, i], bias, local_rows, idx_map[i], draw_pos[i]
+            )
+            draft_ids.append(draft_sampled_i)
             if i + 1 < n_spec:
                 prev.index_copy_(0, local_rows, draft_sampled_i)
+        torch.stack(draft_ids, dim=1, out=sharder.local_draft_ids[:num_local_reqs])

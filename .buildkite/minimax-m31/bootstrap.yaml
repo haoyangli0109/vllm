@@ -1,0 +1,19 @@
+steps:
+  - label: ":pipeline: Bootstrap MiniMax-M3.1 CI"
+    key: minimax-m31-bootstrap
+    command: |
+      set -euo pipefail
+      ci_ref="$${MINIMAX_M31_CI_REF:-nho_tracking}"
+      if [[ ! "$$ci_ref" =~ ^[A-Za-z0-9._/-]+$ ]] ||
+         [[ "$$ci_ref" == *..* ]] ||
+         [[ "$$ci_ref" == *//* ]] ||
+         ! git check-ref-format --branch "$$ci_ref" >/dev/null 2>&1; then
+        echo "ERROR: MINIMAX_M31_CI_REF is not a safe Git branch name" >&2
+        exit 1
+      fi
+      git fetch --no-tags origin "$$ci_ref"
+      git show FETCH_HEAD:.buildkite/minimax-m31/pipeline.yaml |
+        buildkite-agent pipeline upload
+    agents:
+      queue: small_cpu_premerge
+    timeout_in_minutes: 10

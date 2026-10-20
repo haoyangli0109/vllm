@@ -637,6 +637,11 @@ def make_nvfp4_moe_kernel(
     routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     per_token_activation: bool = False,
 ) -> mk.FusedMoEKernel:
+    # Weight-only NVFP4 backends consume A16, regardless of the checkpoint's
+    # activation-quantization recipe. They must not receive per-token A4 flags.
+    if moe_quant_config.use_nvfp4_w4a16:
+        per_token_activation = False
+
     # Create Prepare/Finalize.
     prepare_finalize = maybe_make_prepare_finalize(
         moe=moe_config,

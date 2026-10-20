@@ -1,0 +1,115 @@
+# MiniMax-M3.1 PR CI: aggregated TP4 accuracy on four B300s (one half of a
+# verda-b300 node). Same serving config and evals as
+# examples/minimax-m31/nvidia/m31-tp4_dspark_spec3.yaml, run from the PR's image.
+# The ${CI_*} variables come from the b300-tp4 agent (GPU half, port, HF
+# cache); run-tp4-evals.sh exports the ${MINIMAX_M31_*} ones.
+
+model: Inferact/Minimax-M3-NVFP4
+revision: 9333bb651e663fbac2f1a01bc09bcf62e45c49b5
+mode: local
+precheck: true
+collect_env: true
+
+pre_serve:
+  - cmd: |
+      bash -c 'S=${CI_HF_HOME}/hub/models--Inferact--Minimax-M3-NVFP4/snapshots/{revision}; test -f $$S/model.safetensors.index.json || { echo "[weights-guard] FAIL: no index.json at $$S"; exit 1; }; test -f $$S/tokenizer.json || { echo "[weights-guard] FAIL: no tokenizer.json"; exit 1; }; ls -1 $$S/model-*.safetensors | wc -l | grep -qx 78 || { echo "[weights-guard] FAIL: wrong shard count, expected 78"; exit 1; }; test -f $$S/dspark/config.json || { echo "[weights-guard] FAIL: no dspark/ draft"; exit 1; }; echo "[weights-guard] OK 78 shards + dspark/ at {revision}"'
+  # The image's CUDA 13.4 runtime runs on the hosts' R580 driver through the
+  # forward-compat libraries it ships in /usr/local/cuda/compat.
+  - cmd: |
+      docker run --rm --gpus '"device=${CI_GPU_DEVICES}"' --entrypoint bash ${MINIMAX_M31_IMAGE} -c 'H=$${CUDA_HOME:-/usr/local/cuda}; $$H/bin/nvcc --version 2>/dev/null | grep -q "release 13.4" || { echo "[cuda-guard] FAIL: the image CUDA_HOME ($$H) is not a CUDA 13.4 toolkit"; exit 1; }; python3 -c "import ctypes, torch; v = ctypes.c_int(); ctypes.CDLL(\"libcuda.so.1\").cuDriverGetVersion(ctypes.byref(v)); assert torch.version.cuda.startswith(\"13.4\") and v.value >= 13040, (torch.version.cuda, v.value); print(\"[cuda-guard] OK torch\", torch.__version__, \"driver API\", v.value)"'
+
+serving:
+  roles:
+    - role: worker
+      count: 1
+      nodes_per_instance: 1
+      gpus_per_node: 4
+      tp_size: 4
+      base_port: ${CI_SERVE_PORT}
+      vllm_engine:
+        docker:
+          image: "${MINIMAX_M31_IMAGE}"
+          args: >-
+            --gpus '"device=${CI_GPU_DEVICES}"'
+            --ipc=host --shm-size=64g
+            --ulimit memlock=-1 --ulimit stack=67108864 --ulimit nofile=65536:65536
+            -p ${CI_SERVE_PORT}:${CI_SERVE_PORT}
+            -v ${CI_HF_HOME}:${CI_HF_HOME}:ro
+            -v ${MINIMAX_M31_LOG_DIR}:${MINIMAX_M31_LOG_DIR}
+            --label ${MINIMAX_M31_CONTAINER_LABEL}
+        cmd: >-
+          {model}
+          --revision {revision}
+          --served-model-name {model}
+          --port {port}
+          -tp 4
+          --reasoning-parser minimax_m3
+          --block-size 128
+          --kv-cache-dtype nvfp4
+          --attention-config '{"indexer_kv_dtype": "nvfp4", "use_prefill_query_quantization": true}'
+          --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}'
+          --speculative-config '{"method": "dspark", "model": "${CI_HF_HOME}/hub/models--Inferact--Minimax-M3-NVFP4/snapshots/{revision}/dspark", "num_speculative_tokens": 3, "draft_sample_method": "probabilistic", "rejection_sample_method": "block", "attention_backend": "FLASH_ATTN", "kv_cache_dtype": "fp8"}'
+          --max-num-seqs 256
+          --max-model-len 1048576
+          --disable-hybrid-kv-cache-manager
+          --limit-mm-per-prompt '{"video": 0}'
+        env:
+          VLLM_FLOAT32_MATMUL_PRECISION: "high"
+          VLLM_ENGINE_READY_TIMEOUT_S: "3600"
+          TMPDIR: "/tmp"
+          HF_HOME: "${CI_HF_HOME}"
+          HF_HUB_OFFLINE: "1"
+        health_check:
+          url: http://localhost:{port}/health
+          timeout_s: 3600
+          poll_interval_s: 10
+
+post_serve:
+  - cmd: |
+      bash -lc '
+        set -euo pipefail
+        curl -fsS -X POST "http://localhost:${CI_SERVE_PORT}/v1/chat/completions" \
+          -H "Content-Type: application/json" \
+          -d "{\"model\":\"{model}\",\"messages\":[{\"role\":\"user\",\"content\":\"Say hello in one word.\"}],\"max_tokens\":256,\"temperature\":0,\"chat_template_kwargs\":{\"thinking_mode\":\"enabled\"}}" \
+          | tee "{log_dir}/smoke_chat.json"
+        echo
+      '
+
+  - mqa:
+      model: Inferact/Minimax-M3-NVFP4
+      base_url: http://localhost:${CI_SERVE_PORT}
+      api_type: chat_completions
+      think: true
+      extra_params:
+        chat_template_kwargs:
+          thinking_mode: enabled
+      top_p: 0.95
+      max_tokens: 98304
+      concurrency: 256
+      timeout_s: 60000
+      output_dir: "{log_dir}/mqa"
+      save_interactions: true
+      tasks:
+        - task: gpqa_diamond
+          epoch_num: 4
+          temperature: 0.6
+        - task: aime25
+          epoch_num: 16
+          temperature: 1.0
+          task_args:
+            step_by_step: false
+        - task: mmmu_pro
+          epoch_num: 1
+          temperature: 1.0
+
+  # Dropped by run-tp4-evals.sh only on manual runs with
+  # MINIMAX_M31_MQA_PUSH_REQUIRED=0 and no dashboard credentials.
+  - push:
+      mode: acc
+      path: "{log_dir}/mqa"
+      env_file: "${MINIMAX_M31_MQA_ENV_FILE}"
+      gpu_count: 4
+      note: >-
+        nho2 PR #${MINIMAX_M31_PR_NUMBER} @ ${MINIMAX_M31_SOURCE_COMMIT};
+        ${BUILDKITE_BUILD_URL}; minimax-m3 nvfp4 @9333bb65 agg tp4 b300,
+        nvfp4 kv + nvfp4 indexer on the q8kv4 kernels, dspark spec3 (fp8 draft kv)

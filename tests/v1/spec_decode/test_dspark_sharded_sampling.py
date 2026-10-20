@@ -135,6 +135,7 @@ def _make_speculator(
     spec._anchor_idx = (
         torch.arange(MAX_NUM_REQS, dtype=torch.int64, device=DEVICE) * NUM_STEPS
     )
+    spec._req_rows = torch.arange(MAX_NUM_REQS, dtype=torch.int64, device=DEVICE)
     spec.draft_tokens = torch.zeros(
         MAX_NUM_REQS, NUM_STEPS, dtype=torch.int64, device=DEVICE
     )
@@ -340,3 +341,53 @@ def test_sharded_draft_stage_replays_in_cuda_graph(default_vllm_config):
     ref._run_model = lambda *args, **kwargs: head_hidden
     ref._generate_draft(num_reqs_padded, num_reqs_padded * NUM_STEPS, None, None, None)
     _check_against_replicated(ref, specs, slots)
+
+
+def _sample_sequential_unfused(spec, num_reqs: int, head_hidden: torch.Tensor):
+    """The replicated Markov loop with the bias added outside the Gumbel kernel."""
+    num_sample = num_reqs * NUM_STEPS
+    sample_hidden = head_hidden[spec.sample_indices[:num_sample]]
+    base_logits = spec.model.compute_draft_logits(sample_hidden)
+    base_logits = base_logits.view(num_reqs, NUM_STEPS, -1)
+    idx_map = spec.sample_idx_mapping[:num_sample].view(num_reqs, NUM_STEPS)
+    sample_pos = spec.sample_pos[:num_sample].view(num_reqs, NUM_STEPS)
+    prev = spec.input_buffers.input_ids[spec._anchor_idx[:num_reqs]]
+    for i in range(NUM_STEPS):
+        bias = spec.model.markov_bias(spec.model.markov_embed(prev))
+        prev = spec._sample_logits(
+            base_logits[:, i] + bias, idx_map[:, i], sample_pos[:, i], i
+        )
+        spec.draft_tokens[:num_reqs, i] = prev
+
+
+@pytest.mark.parametrize("probabilistic", [True, False])
+@pytest.mark.parametrize("reduced_vocab", [False, True])
+@pytest.mark.parametrize("batch", range(len(_BATCHES)))
+def test_replicated_markov_sampling_matches_unfused(
+    default_vllm_config, probabilistic: bool, reduced_vocab: bool, batch: int
+):
+    """In every mode, the replicated loop gives the draft ids and cached draft
+    logits of adding the Markov bias first. Probabilistic full-vocab drafting
+    adds it inside the Gumbel kernel."""
+    rng = np.random.default_rng(batch)
+    slots, num_reqs_padded = _BATCHES[batch]
+    if slots is None:
+        slots = rng.choice(MAX_NUM_REQS, size=37, replace=False)
+    shards, markov_head, d2t, target_vocab = _make_weights(reduced_vocab)
+    inputs = _make_inputs(rng, np.asarray(slots, dtype=np.int64), target_vocab)
+    head_hidden = torch.randn(
+        num_reqs_padded * NUM_STEPS, HIDDEN, device=DEVICE, dtype=DTYPE
+    )
+    specs = [
+        _make_speculator(
+            shards, markov_head, d2t, target_vocab, 0, probabilistic, inputs
+        )
+        for _ in range(2)
+    ]
+    specs[0]._sample_sequential(num_reqs_padded, head_hidden)
+    _sample_sequential_unfused(specs[1], num_reqs_padded, head_hidden)
+    assert torch.equal(specs[0].draft_tokens, specs[1].draft_tokens)
+    if probabilistic:
+        draft_logits = specs[0].draft_logits
+        assert draft_logits is not None and draft_logits.any()
+        assert torch.equal(draft_logits, specs[1].draft_logits)
