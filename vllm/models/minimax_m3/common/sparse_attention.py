@@ -255,7 +255,7 @@ class MiniMaxM3SparseMetadataBuilder(AttentionMetadataBuilder[MiniMaxM3SparseMet
     ) -> None:
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
-        # Stable context-length buffer for decode cudagraph replays.
+        # Stable context-length buffer for the prefill metadata.
         self.context_len_buffer = torch.empty(
             vllm_config.scheduler_config.max_num_batched_tokens,
             dtype=torch.int32,
@@ -297,14 +297,13 @@ class MiniMaxM3SparseMetadataBuilder(AttentionMetadataBuilder[MiniMaxM3SparseMet
         assert num_decodes + num_prefills == num_reqs
         assert num_decode_tokens + num_prefill_tokens == num_tokens
 
-        # Decode-first batch: context lengths into the stable cudagraph buffer.
-        context_lens = self.context_len_buffer[:num_reqs]
-        context_lens.copy_(
-            common_attn_metadata.compute_num_computed_tokens(), non_blocking=True
-        )
-
         prefill_metadata: MiniMaxM3SparsePrefillMetadata | None = None
         if num_prefills > 0:
+            # Only prefill reads the context lengths; decode-only steps skip it.
+            context_lens = self.context_len_buffer[:num_reqs]
+            context_lens.copy_(
+                common_attn_metadata.compute_num_computed_tokens(), non_blocking=True
+            )
             seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound
             assert seq_lens_cpu is not None
             prefill_seq_lens_cpu = seq_lens_cpu[num_decodes:]
@@ -430,10 +429,11 @@ class MiniMaxM3SparseImpl(AttentionImplBase[MiniMaxM3SparseMetadata]):
         query: torch.Tensor,
         kv_cache: torch.Tensor,
         output: torch.Tensor,
-        *,
-        query_fp8: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Attend the queries to the indexer-selected blocks. Per kernel.
+
+        ``query`` is E4M3 for impls with ``use_cutlass_decode``, else the model
+        dtype.
 
         The indexer has already written the top-k block ids into
         ``layer.topk_indices_buffer`` (decode at ``[:, :nd]``, prefill at
@@ -454,8 +454,6 @@ class MiniMaxM3SparseTritonImpl(MiniMaxM3SparseImpl):
         query: torch.Tensor,
         kv_cache: torch.Tensor,
         output: torch.Tensor,
-        *,
-        query_fp8: torch.Tensor | None = None,
     ) -> torch.Tensor:
         attn_metadata = get_forward_context().attn_metadata
         if not isinstance(attn_metadata, dict):
@@ -536,9 +534,21 @@ def select_main_backend_and_impl_cls(
     Blackwell (SM100) uses the MSA attend for supported top-k block counts
     when the KV cache is BF16, FP8 E4M3 or NVFP4; MI355 uses AITER sparse PA
     with shuffle KV cache layout; Other platforms and FP8 E5M2 fall
-    back to Triton. NVFP4 is MSA-only. The MSA modules are imported lazily to
-    avoid import errors on unsupported platforms.
+    back to Triton. NVFP4 is served by MSA on SM100 and by the FlyDSL NVFP4
+    attend on ROCm gfx950 (amd/sparse_attention_nvfp4.py). The MSA modules are
+    imported lazily to avoid import errors on unsupported platforms.
     """
+    if current_platform.is_rocm() and kv_cache_dtype == "nvfp4":
+        from vllm.models.minimax_m3.amd.sparse_attention_nvfp4 import (
+            MiniMaxM3SparseRocmNvfp4Backend,
+            MiniMaxM3SparseRocmNvfp4Impl,
+        )
+
+        logger.info_once(
+            "MiniMax M3 sparse attention selected ROCm NVFP4 (topk_blocks=%s)",
+            topk_blocks,
+        )
+        return MiniMaxM3SparseRocmNvfp4Backend, MiniMaxM3SparseRocmNvfp4Impl
     use_aiter_sparse_pa = minimax_m3_use_aiter_sparse_pa(
         num_kv_heads, emits_sparse_block_table=emits_sparse_block_table
     )
@@ -557,8 +567,8 @@ def select_main_backend_and_impl_cls(
     if use_nvfp4 and (use_aiter_sparse_pa or not use_msa):
         raise ValueError(
             "MiniMax M3 sparse attention supports an NVFP4 KV cache only with "
-            f"the SM100 MSA backend (kv_cache_dtype={kv_cache_dtype}, "
-            f"topk_blocks={topk_blocks})"
+            "the SM100 MSA backend or on ROCm gfx950 "
+            f"(kv_cache_dtype={kv_cache_dtype}, topk_blocks={topk_blocks})"
         )
     selected = (
         "AITER_SPARSE_PA" if use_aiter_sparse_pa else ("MSA" if use_msa else "Triton")
@@ -581,10 +591,11 @@ def select_main_backend_and_impl_cls(
             MiniMaxM3SparseMSABackend,
             MiniMaxM3SparseMSAImpl,
             MiniMaxM3SparseMSANvfp4Backend,
+            MiniMaxM3SparseMSANvfp4Impl,
         )
 
         if use_nvfp4:
-            return MiniMaxM3SparseMSANvfp4Backend, MiniMaxM3SparseMSAImpl
+            return MiniMaxM3SparseMSANvfp4Backend, MiniMaxM3SparseMSANvfp4Impl
         return MiniMaxM3SparseMSABackend, MiniMaxM3SparseMSAImpl
     return MiniMaxM3SparseBackend, MiniMaxM3SparseTritonImpl
 

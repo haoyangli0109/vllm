@@ -24,7 +24,6 @@ from torch import nn
 from transformers import PreTrainedConfig
 
 from vllm import _custom_ops as ops
-from vllm import envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import (
@@ -44,10 +43,12 @@ from vllm.model_executor.layers.fused_allreduce_gemma_rms_norm import (
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEFactory,
     GateLinear,
+    RoutedExperts,
     fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.fused_moe.utils import (
     is_model_fused_shared_expert_compatible,
+    resolve_layer_fused_shared_expert,
 )
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
@@ -57,9 +58,7 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
-from vllm.model_executor.layers.quantization.utils.config_utils import (
-    is_shared_expert_quant_fse_compatible,
-)
+from vllm.model_executor.layers.quantization.modelopt import ModelOptMxFp8Config
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -92,6 +91,11 @@ from vllm.models.minimax_m3.amd.indexer_aiter import (
     MiniMaxM3AiterIndexer,
     select_aiter_indexer_impl_cls,
 )
+from vllm.models.minimax_m3.amd.indexer_nvfp4 import (
+    MiniMaxM3IndexerRocmNvfp4Impl,
+    init_rocm_nvfp4_indexer_decode_cp,
+)
+from vllm.models.minimax_m3.amd.mono.envs import envs as mono_envs
 from vllm.models.minimax_m3.amd.ops import (
     gemma_fused_add_rmsnorm,
     gemma_rmsnorm,
@@ -110,7 +114,10 @@ from vllm.models.minimax_m3.amd.sparse_attention_msa import (
 from vllm.models.minimax_m3.common.encoder_cudagraph import (
     MiniMaxM3EncoderCudaGraphMixin,
 )
-from vllm.models.minimax_m3.common.indexer import MiniMaxM3Indexer
+from vllm.models.minimax_m3.common.indexer import (
+    MiniMaxM3Indexer,
+    MiniMaxM3IndexerImpl,
+)
 from vllm.models.minimax_m3.common.mm_preprocess import (
     MiniMaxM3VLDummyInputsBuilder,
     MiniMaxM3VLMultiModalProcessor,
@@ -355,6 +362,30 @@ class MiniMaxM3MoE(nn.Module):
                 f"the number of experts {config.num_local_experts}."
             )
 
+        # MiniMax-M3.1 like checkpoints (`quant_method: mxfp8`, `moe_quant_algo:
+        # NVFP4`) have no native NVFP4 MoE backend on ROCm: the routed experts must be
+        # re-quantized online.
+        experts_prefix = f"{prefix}.experts"
+        if (
+            isinstance(quant_config, ModelOptMxFp8Config)
+            and quant_config.moe_quant_algo == "NVFP4"
+            and not quant_config.is_layer_excluded(experts_prefix)
+            and (
+                quant_config.online_quantization_config is None
+                or quant_config.online_quantization_config.resolve_quant_method_cls(
+                    RoutedExperts, experts_prefix
+                )
+                is None
+            )
+        ):
+            raise NotImplementedError(
+                "This MiniMax model with NVFP4 MoE experts "
+                "(`moe_quant_algo: NVFP4`, `moe_quant_format: nvfp4-pack-quantized`) "
+                "is not supported on ROCm. Please use `--quantization-config.moe "
+                "mxfp8` (or `--quantization-config.moe mxfp4`) to re-quantize the "
+                "MoE to MXFP8 (or MXFP4) when loading to serve on ROCm."
+            )
+
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
         self.n_shared_experts = getattr(config, "n_shared_experts", None)
 
@@ -388,30 +419,16 @@ class MiniMaxM3MoE(nn.Module):
         # top-k kernel; otherwise it goes through the vLLM top-k bias router.
         # It is disabled under expert parallelism (the shared slot is appended to
         # the routed top-k, which the EP expert-mapping path does not handle).
-        # TODO: Historically, only `VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS=1`
-        # is checked to enable FSE for MiniMax-M3, despite AITER not being used.
-        # This should be cleaned up and use `resolve_layer_fused_shared_expert`.
-        fse_requested = envs.VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS
-
         self.is_fused_shared_expert_enabled = False
         if (
-            fse_requested
-            and bool(getattr(config, "n_shared_experts", None))
+            bool(getattr(config, "n_shared_experts", None))
             and not get_current_vllm_config().parallel_config.enable_expert_parallel
         ):
-            fse_compatible, fse_reason = is_shared_expert_quant_fse_compatible(
+            self.is_fused_shared_expert_enabled = resolve_layer_fused_shared_expert(
                 quant_config,
-                f"{prefix}.experts",
-                f"{prefix}.shared_experts",
+                prefix,
+                shared_expert_name="shared_experts",
             )
-            if not fse_compatible:
-                logger.warning(
-                    "VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS is enabled but "
-                    "cannot be enabled: %s.",
-                    fse_reason,
-                )
-            else:
-                self.is_fused_shared_expert_enabled = True
 
         # When additionally on gfx950 with an active aiter MoE backend, the shared
         # expert is appended inside aiter's an active aiter MoE backend, the shared
@@ -733,23 +750,39 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         # Shared top-k buffer: the indexer writes the selected blocks into it and
         # the attend impl reads them back (no Python value crosses the break).
         self.topk_indices_buffer = topk_indices_buffer
+        # NVFP4 main K/V: the FlyDSL NVFP4 attend and indexer
+        # (sparse_attention_nvfp4.py, indexer_nvfp4.py). One fused kernel
+        # inserts both caches, so the index cache is NVFP4 too.
+        self.use_nvfp4_kv = get_kv_quant_mode(self.kv_cache_dtype).is_nvfp4
         # Indexer and main attention are separate impls. The AITER indexer is
         # ROCm-only, so it is selected here rather than inside the neutral
         # MiniMaxM3Indexer, which knows nothing about it and would pick Triton.
-        indexer_impl_cls = select_aiter_indexer_impl_cls(
-            topk_blocks=sparse_cfg["sparse_topk_blocks"],
-            sparse_block_size=sparse_cfg["sparse_block_size"],
-            num_index_heads=self.num_idx_heads,
-            index_head_dim=self.idx_head_dim,
-            indexer_kv_dtype=self.indexer_kv_dtype,
-            score_type=sparse_cfg.get("sparse_score_type", "max"),
-        )
+        indexer_impl_cls: type[MiniMaxM3IndexerImpl] | None
+        if self.use_nvfp4_kv:
+            if self.indexer_kv_dtype != "nvfp4":
+                raise ValueError(
+                    "MiniMax M3 with an NVFP4 KV cache on ROCm needs the NVFP4 "
+                    "index cache (attention_config.indexer_kv_dtype='nvfp4'), "
+                    f"got {self.indexer_kv_dtype!r}"
+                )
+            indexer_impl_cls = MiniMaxM3IndexerRocmNvfp4Impl
+        else:
+            indexer_impl_cls = select_aiter_indexer_impl_cls(
+                topk_blocks=sparse_cfg["sparse_topk_blocks"],
+                sparse_block_size=sparse_cfg["sparse_block_size"],
+                num_index_heads=self.num_idx_heads,
+                index_head_dim=self.idx_head_dim,
+                indexer_kv_dtype=self.indexer_kv_dtype,
+                score_type=sparse_cfg.get("sparse_score_type", "max"),
+            )
         # The attend gate below needs this: an emitted table is what lets it
         # serve more than one KV head per rank. Buffers to write the table into
         # only arrive when the model already resolved the attend to the AITER
         # path the table addresses, so that is not rechecked here.
         self.indexer_emits_table = (
-            indexer_impl_cls is not None and sparse_table_buffers is not None
+            not self.use_nvfp4_kv
+            and indexer_impl_cls is not None
+            and sparse_table_buffers is not None
         )
         # The backend names the metadata builder, which for the AITER path is
         # the one that rebases the block table the indexer's top-k resolves
@@ -770,8 +803,10 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             topk_blocks=sparse_cfg["sparse_topk_blocks"],
             sparse_block_size=sparse_cfg["sparse_block_size"],
         )
-        self.use_aiter_sparse_pa = minimax_m3_use_aiter_sparse_pa(
-            self.num_kv_heads, emits_sparse_block_table=self.indexer_emits_table
+        self.use_aiter_sparse_pa = not self.use_nvfp4_kv and (
+            minimax_m3_use_aiter_sparse_pa(
+                self.num_kv_heads, emits_sparse_block_table=self.indexer_emits_table
+            )
         )
         self.kv_cache_k = torch.tensor([])
         self.kv_cache_v = torch.tensor([])
@@ -960,6 +995,49 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             return
         minimax_m3_insert_index_cache(index_k, index_cache, index_slot_mapping)
 
+    def _norm_rope_nvfp4_insert(
+        self,
+        qkv: torch.Tensor,
+        positions: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        index_slot_mapping: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """q/k/index-q/index-k Gemma norm + RoPE, and the NVFP4 K/V and index-K
+        inserts, in one FlyDSL launch (``ops/norm_rope_nvfp4_insert``). Returns
+        the bf16 q and the e4m3 index-q."""
+        from vllm.models.minimax_m3.amd.ops.norm_rope_nvfp4_insert import (
+            minimax_m3_norm_rope_nvfp4_insert,
+        )
+
+        num_tokens = qkv.shape[0]
+        q = qkv.new_empty((num_tokens, self.q_size))
+        index_q = qkv.new_empty(
+            (num_tokens, self.index_q_size),
+            dtype=self.indexer.index_cache.query_dtype,
+        )
+        minimax_m3_norm_rope_nvfp4_insert(
+            qkv,
+            self.q_norm.weight,
+            self.k_norm.weight,
+            self.index_q_norm.weight,
+            self.index_k_norm.weight,
+            self.rotary_emb.cos_sin_cache,
+            positions,
+            slot_mapping,
+            index_slot_mapping,
+            self.kv_cache,
+            self.indexer.index_cache.kv_cache,
+            self._k_scale,
+            self._v_scale,
+            q,
+            index_q,
+            num_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+            num_index_heads=self.num_idx_heads,
+            eps=self.q_norm.variance_epsilon,
+        )
+        return q, index_q
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -990,6 +1068,19 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             return qkv.new_zeros((num_tokens, self.hidden_size))
 
         main_slot_mapping = fwd_slot_mapping[self.layer_name]
+        if self.use_nvfp4_kv:
+            q, index_q = self._norm_rope_nvfp4_insert(
+                qkv,
+                positions,
+                main_slot_mapping,
+                fwd_slot_mapping[self.indexer.index_cache.prefix],
+            )
+            output = torch.empty_like(q)
+            attn_output = self._run_attention(
+                q, None if self.skip_index_topk else index_q, output
+            )
+            output, _ = self.o_proj(attn_output)
+            return output
         q = qkv.new_empty((num_tokens, self.q_size))
         key_cache = value_cache = page16_slot_mapping = None
         k_scale = v_scale = None
@@ -1361,6 +1452,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
 
 class MiniMaxM3Model(nn.Module, EagleModelMixin):
     fall_back_to_pt_during_load = False
+    supports_aux_hidden_states_over_pp = True
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -1408,7 +1500,10 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
             # num_idx_heads from num_kv_heads, not from sparse_num_index_heads),
             # so this cannot land on the other side of the MFMA column limit
             # from the selection the layer makes.
-            emits_table = (
+            use_nvfp4_kv = get_kv_quant_mode(
+                vllm_config.cache_config.cache_dtype
+            ).is_nvfp4
+            emits_table = not use_nvfp4_kv and (
                 select_aiter_indexer_impl_cls(
                     topk_blocks=sparse_cfg["sparse_topk_blocks"],
                     sparse_block_size=sparse_cfg["sparse_block_size"],
@@ -1433,6 +1528,12 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
                         dtype=torch.int32,
                     ),
                     torch.empty(rows, dtype=torch.int32),
+                )
+            if use_nvfp4_kv:
+                # Collective over the TP group (IPC buffers): every rank builds
+                # the model at the same point, outside graph capture.
+                init_rocm_nvfp4_indexer_decode_cp(
+                    vllm_config.model_config.max_model_len
                 )
         else:
             self.topk_indices_buffer = None
@@ -1462,6 +1563,13 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
         )
+        # VLLM_ROCM_MINIMAX_M3_MONO=1: supported decode steps run one FlyDSL
+        # launch per layer (mono kernels)
+        self._mono = None
+        if mono_envs.MONO_ENABLE:
+            from vllm.models.minimax_m3.amd.mono.dispatch import MonoDecode
+
+            self._mono = MonoDecode(self, vllm_config)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -1473,6 +1581,10 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
+        if self._mono is not None and self._mono.supports(
+            input_ids, positions, intermediate_tensors, inputs_embeds
+        ):
+            return self._mono.forward(input_ids, positions, inputs_embeds)
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -1484,9 +1596,15 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
-        # EAGLE3 is not yet compatible with pipeline parallel
-        aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
-        for idx, layer in enumerate(self.layers[self.start_layer : self.end_layer]):
+        remote_aux = self.collect_remote_aux_hidden_states(intermediate_tensors)
+        aux_hidden_states: list[torch.Tensor] = []
+        if get_pp_group().is_first_rank:
+            self._maybe_add_hidden_state(
+                aux_hidden_states, self.start_layer, hidden_states, residual
+            )
+        for idx, layer in enumerate(
+            self.layers[self.start_layer : self.end_layer], start=self.start_layer
+        ):
             hidden_states, residual = layer(positions, hidden_states, residual)
             self._maybe_add_hidden_state(
                 aux_hidden_states, idx + 1, hidden_states, residual
@@ -1494,11 +1612,16 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
-                {"hidden_states": hidden_states, "residual": residual}
+                {
+                    "hidden_states": hidden_states,
+                    "residual": residual,
+                    **self.pack_local_aux_hidden_states(aux_hidden_states),
+                }
             )
 
         hidden_states, _ = self.norm(hidden_states, residual)
 
+        aux_hidden_states = remote_aux + aux_hidden_states
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
         return hidden_states
