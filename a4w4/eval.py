@@ -1,14 +1,15 @@
 """MiniMax-M3.1 accuracy evals on the Inferact/mqa protocol, standalone (needs only `datasets` and Pillow).
 
 Reproduces what our numbers come from (mqa `--api-type chat_completions --think true` + the M3.1 template kwargs):
-  aime26           mqa `--task aime26 --task-args '{"step_by_step": false}'`, 16 epochs, max_tokens 98304,
+  aime26           mqa `--task aime26 --task-args '{"step_by_step": false}'`, 16 epochs, max_tokens 128000,
                    every request up front; score = exact match on the last \\boxed{} (avg@16), plus pass@16.
   mmmu_pro         mqa branch m31/provider-verification `--task mmmu_pro --task-args '{"subset": "all"}'`
-                   (vision + standard (10 options), 3460 questions), 1 epoch, max_tokens 65536, concurrency 256;
+                   (vision + standard (10 options), 3460 questions), 1 epoch, max_tokens 192000, concurrency 256;
                    scores strict-match (last line 'Answer: X') and flexible-match, overall and per subset.
-All requests: temperature 1.0, top_p 0.95, chat_template_kwargs {thinking_mode: enabled, thinking: true,
+All requests: temperature 1.0, top_p 0.95, chat_template_kwargs {thinking_mode: adaptive, thinking: true,
 enable_thinking: true}, thinking {type: enabled}, timeout 60000 s. Prompts, image encoding (RGB -> JPEG, text first)
-and scoring are mqa's, copied.
+and scoring are mqa's, copied. thinking_mode adaptive: the 929ced46 chat template is adaptive only (it ignores
+thinking_mode), and with adaptive the older template (a60dfa7f, AMD's Quark MXFP4 export) renders the same prompt.
 
     python3 m31_eval.py --base-url http://localhost:8000 --model <served name> --task aime26 --out ./out
     python3 m31_eval.py --base-url http://localhost:8000 --model <served name> --task mmmu_pro --out ./out
@@ -203,14 +204,14 @@ def main():
     ap.add_argument("--task", required=True, choices=["aime26", "mmmu_pro"])
     ap.add_argument("--subset", default="all", choices=["all", "vision", "standard"], help="mmmu_pro only")
     ap.add_argument("--epochs", type=int, help="default 16 for AIME, 1 for MMMU-Pro")
-    ap.add_argument("--max-tokens", type=int, help="default 98304 for AIME, 65536 for MMMU-Pro")
+    ap.add_argument("--max-tokens", type=int, help="default 128000 for AIME, 192000 for MMMU-Pro")
     ap.add_argument("--concurrency", type=int, help="default: every AIME request at once (480), 256 for MMMU-Pro")
     ap.add_argument("--out", default="./m31_eval_out")
     args = ap.parse_args()
 
     aime = args.task != "mmmu_pro"
     epochs = args.epochs or (16 if aime else 1)
-    max_tokens = args.max_tokens or (98304 if aime else 65536)
+    max_tokens = args.max_tokens or (128000 if aime else 192000)
     items = aime_items(args.task) if aime else mmmu_items(args.subset)
     jobs = [(e, it) for e in range(epochs) for it in items]
     concurrency = args.concurrency or (len(jobs) if aime else 256)
@@ -234,7 +235,7 @@ def main():
         epoch, it = job
         body = {"model": args.model, "messages": it["messages"], "max_tokens": max_tokens, "temperature": 1.0,
                 "top_p": 0.95,
-                "chat_template_kwargs": {"thinking_mode": "enabled", "enable_thinking": True, "thinking": True},
+                "chat_template_kwargs": {"thinking_mode": "adaptive", "enable_thinking": True, "thinking": True},
                 "thinking": {"type": "enabled"}}
         req = urllib.request.Request(url, json.dumps(body).encode(), {"Content-Type": "application/json"})
         out = json.load(urllib.request.urlopen(req, timeout=60000))

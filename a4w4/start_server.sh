@@ -29,4 +29,4 @@ python3 -m vllm.entrypoints.openai.api_server --model /model --served-model-name
     "draft_sample_method": "probabilistic", "rejection_sample_method": "block",
     "attention_backend": "TRITON_ATTN", "kv_cache_dtype": "fp8"}' \
   --max-num-seqs 256 --gpu-memory-utilization 0.9 --limit-mm-per-prompt '{"video": 0}' \
-  -enable-prefix-caching --disable-hybrid-kv-cache-manager
+  --enable-prefix-caching --disable-hybrid-kv-cache-manager
