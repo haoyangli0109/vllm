@@ -11,8 +11,8 @@ enable_thinking: true}, thinking {type: enabled}, timeout 60000 s. Prompts, imag
 and scoring are mqa's, copied. thinking_mode adaptive: the 929ced46 chat template is adaptive only (it ignores
 thinking_mode), and with adaptive the older template (a60dfa7f, AMD's Quark MXFP4 export) renders the same prompt.
 
-    python3 m31_eval.py --base-url http://localhost:8000 --model <served name> --task aime26 --out ./out
-    python3 m31_eval.py --base-url http://localhost:8000 --model <served name> --task mmmu_pro --out ./out
+    python3 eval.py --base-url http://localhost:28870 --model minimax-m31-flash --task aime26 --out ./out
+    python3 eval.py --base-url http://localhost:28870 --model minimax-m31-flash --task mmmu_pro --out ./out
 
 Results: <out>/<task>.jsonl (one record per request; a rerun skips the records already there) and
 <out>/<task>_summary.json.
