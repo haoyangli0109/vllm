@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# MiniMax-M3.1-Flash on MI355X, inside the a4w4/docker.sh container. The first run builds this tree's ROCm extensions
-# (its csrc differs from the image's; REBUILD=1 builds again), then it serves: TP4, the checkpoint's MXFP4 experts on
-# aiter W4A4 at every batch size, NVFP4 KV + NVFP4 indexer, DSpark 3.
-#   ./start_server.sh /model/MiniMax-M3.1-Flash-Quark-MXFP4      [PORT=8000] [HIP=0,1,2,3] [REBUILD=1]
+# MiniMax-M3.1-Flash on MI355X, inside the container (a4w4/docker.sh starts it and runs this). The first run builds
+# this tree's ROCm extensions (its csrc differs from the image's; REBUILD=1 builds again), then it serves: TP4, the
+# checkpoint's MXFP4 experts on aiter W4A4 at every batch size, NVFP4 KV + NVFP4 indexer, DSpark 3.
+#   ./start_server.sh [checkpoint dir, default $MODEL]      [PORT=8000] [HIP=0,1,2,3] [REBUILD=1]
 set -euo pipefail
-if [[ $# -ne 1 || ! -f $1/config.json ]]; then
-  echo "usage: $0 <checkpoint directory, e.g. /model/MiniMax-M3.1-Flash-Quark-MXFP4>" >&2; exit 1
+M=${1:-${MODEL:-}} NHO2=$(cd "$(dirname "$0")/.." && pwd)
+if [[ -z $M || ! -f $M/config.json ]]; then
+  echo "usage: $0 <checkpoint directory>, or MODEL=<checkpoint directory> (got '$M')" >&2; exit 1
 fi
-M=$1 NHO2=$(cd "$(dirname "$0")/.." && pwd)
 B=$NHO2/build/rocm
 if [[ ${REBUILD:-0} == 1 || ! -f $B/.a4w4_built ]]; then
   export PATH=/usr/local/bin:/usr/local/lib/python3.12/dist-packages/cmake/data/bin:$PATH PYTORCH_ROCM_ARCH=gfx950
