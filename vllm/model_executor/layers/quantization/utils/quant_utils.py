@@ -265,6 +265,29 @@ kMxfp8Dynamic = QuantKey(FP8_DTYPE, scale=kMxfp8DynamicGroupScale, symmetric=Tru
 kMxfp4StaticGroupScale = ScaleDesc(MXFP_SCALE_DTYPE, True, GroupShape(1, 32))
 kMxfp4Static = QuantKey(FP4_DTYPE, scale=kMxfp4StaticGroupScale, symmetric=True)
 
+
+def mxfp4_mbs_key(macro_block: int, static: bool) -> QuantKey:
+    """MXFP4 with macro block scaling (arXiv:2603.08713): the E8M0 scale per 32
+    values plus an E0M8 factor (its 8 mantissa bits) per `macro_block` values."""
+    return QuantKey(
+        FP4_DTYPE,
+        scale=kMxfp4StaticGroupScale if static else kMxfp4DynamicGroupScale,
+        scale2=ScaleDesc(torch.uint8, static, GroupShape(1, macro_block)),
+        symmetric=True,
+    )
+
+
+def is_mxfp4_mbs_key(key: "QuantKey | None") -> bool:
+    return (
+        key is not None
+        and key.dtype == FP4_DTYPE
+        and key.scale.group_shape == GroupShape(1, 32)
+        and key.scale2 is not None
+        and key.scale2.dtype == torch.uint8
+        and key.scale2.group_shape.row == 1
+    )
+
+
 kMxfp6E3M2StaticGroupScale = ScaleDesc(MXFP_SCALE_DTYPE, True, GroupShape(1, 32))
 kMxfp6E3M2Static = QuantKey(
     scalar_types.float6_e3m2f, scale=kMxfp6E3M2StaticGroupScale, symmetric=True
