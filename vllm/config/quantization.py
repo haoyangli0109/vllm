@@ -16,6 +16,7 @@ from pydantic_core import core_schema
 from vllm.config.utils import config
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
+    is_mxfp4_mbs_key,
     kFp8Dynamic128Sym,
     kFp8DynamicTensorSym,
     kFp8DynamicTokenSym,
@@ -29,6 +30,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kMxfp8Dynamic,
     kNvfp4DynamicToken,
     kNvfp4Static,
+    mxfp4_mbs_key,
 )
 
 # User-facing names addressable from quantization_config.
@@ -89,6 +91,9 @@ class QuantSpec:
     """Activation quantization key, or a name from QUANT_KEY_NAMES."""
 
     def __str__(self) -> str:
+        if (mbs_name := mxfp4_mbs_name(self)) is not None:
+            return mbs_name
+
         def quant_key_str(quant_key: QuantKey | None) -> str:
             if quant_key is None:
                 return "None"
@@ -144,6 +149,8 @@ class QuantizationConfigArgs:
                     f"online shorthand {v!r} does not define a {field_name} spec"
                 )
             return spec
+        if (spec := mxfp4_mbs_spec(v)) is not None:
+            return spec
         return QuantSpec(weight=_coerce_quant_key(v))
 
     @field_validator("targets", mode="before")
@@ -158,11 +165,14 @@ class QuantizationConfigArgs:
                 raise ValueError(
                     f"targets keys must be strings, got {type(pattern).__name__}"
                 )
-            if not isinstance(shorthand, str) or shorthand not in _ONLINE_SHORTHANDS:
+            if (
+                not isinstance(shorthand, str)
+                or online_shorthand_args(shorthand) is None
+            ):
                 raise ValueError(
                     f"targets[{pattern}] = {shorthand} is not a valid "
                     f"online shorthand name; expected one of "
-                    f"{sorted(_ONLINE_SHORTHANDS)}"
+                    f"{sorted(_ONLINE_SHORTHANDS)} or mxfp4_mbs[<block>][_a|_w]"
                 )
             if pattern.startswith("re:"):
                 try:
@@ -222,6 +232,56 @@ _ONLINE_SHORTHANDS: dict[str, QuantizationConfigArgs] = {
         moe=QuantSpec(weight=kNvfp4Static),
     ),
 }
+
+
+MXFP4_MBS_FORMAT = re.compile(r"mxfp4_mbs(\d+)?(_a|_w)?")
+
+
+def mxfp4_mbs_spec(name: str) -> QuantSpec | None:
+    """MoE spec of `mxfp4_mbs[<block>][_a|_w]`, MXFP4 W4A4 with macro block
+    scaling (arXiv:2603.08713), or None for any other name.
+
+    `<block>` is the macro block (128 by default; 256, 512 or 1024). Weights
+    and activations both carry factors unless `_a` / `_w` keeps them on the
+    activations / weights only, the other side being plain MXFP4."""
+    match = MXFP4_MBS_FORMAT.fullmatch(name.strip().lower())
+    if match is None:
+        return None
+    block = int(match.group(1) or 128)
+    if block not in (128, 256, 512, 1024):
+        raise ValueError(
+            f"unsupported MXFP4 macro block {block} in {name!r}; "
+            "expected 128, 256, 512 or 1024"
+        )
+    side = match.group(2)
+    return QuantSpec(
+        weight=mxfp4_mbs_key(block, static=True) if side != "_a" else kMxfp4Static,
+        activation=(
+            mxfp4_mbs_key(block, static=False) if side != "_w" else kMxfp4Dynamic
+        ),
+    )
+
+
+def mxfp4_mbs_name(spec: QuantSpec) -> str | None:
+    """The `mxfp4_mbs[<block>][_a|_w]` name of a macro-block-scaled spec."""
+    blocks = {
+        side: key.scale2.group_shape.col
+        for side, key in (("w", spec.weight), ("a", spec.activation))
+        if is_mxfp4_mbs_key(key) and key is not None and key.scale2 is not None
+    }
+    if not blocks:
+        return None
+    block = next(iter(blocks.values()))
+    suffix = "" if len(blocks) == 2 else f"_{next(iter(blocks))}"
+    return f"mxfp4_mbs{'' if block == 128 else block}{suffix}"
+
+
+def online_shorthand_args(name: str) -> QuantizationConfigArgs | None:
+    """The config an online shorthand or `mxfp4_mbs*` name (MoE only) stands for."""
+    if name in _ONLINE_SHORTHANDS:
+        return _ONLINE_SHORTHANDS[name]
+    spec = mxfp4_mbs_spec(name)
+    return QuantizationConfigArgs(moe=spec) if spec is not None else None
 
 
 # Names accepted by `--quantization`; "online" means "use quantization_config".

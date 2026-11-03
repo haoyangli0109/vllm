@@ -9,9 +9,9 @@ from typing import Any
 import torch
 
 from vllm.config.quantization import (
-    _ONLINE_SHORTHANDS,
     QuantizationConfigArgs,
     QuantSpec,
+    online_shorthand_args,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
@@ -49,6 +49,9 @@ from vllm.model_executor.layers.quantization.online.mxfp4 import (
     Mxfp4OnlineLinearMethod,
     Mxfp4OnlineMoEMethod,
 )
+from vllm.model_executor.layers.quantization.online.mxfp4_mbs import (
+    Mxfp4MbsOnlineMoEMethod,
+)
 from vllm.model_executor.layers.quantization.online.mxfp8 import (
     Mxfp8OnlineLinearMethod,
     Mxfp8OnlineMoEMethod,
@@ -66,6 +69,7 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
+    is_mxfp4_mbs_key,
     kFp8Static128BlockSym,
     kFp8StaticChannelSym,
     kFp8StaticTensorSym,
@@ -258,6 +262,14 @@ class OnlineQuantizationConfig(QuantizationConfig):
         # Load-time gfx942 requant, not online conversion. Mxfp4MoEMethod owns it.
         if spec.weight == kInt4Static32:
             return None
+        # Macro block scaling is defined by both sides' keys.
+        if is_mxfp4_mbs_key(spec.weight) or is_mxfp4_mbs_key(spec.activation):
+            if not issubclass(layer_cls, RoutedExperts):
+                raise ValueError(
+                    f"{spec} (MXFP4 macro block scaling) is only supported for "
+                    f"MoE experts, not {layer_cls.__name__}."
+                )
+            return Mxfp4MbsOnlineMoEMethod
         cls = table.get(spec.weight)
         if cls is None:
             raise ValueError(
@@ -370,7 +382,8 @@ class OnlineQuantizationConfig(QuantizationConfig):
             )
         target_pattern = matches[0]
         quant_key_str = self.args.targets[target_pattern]
-        shorthand = _ONLINE_SHORTHANDS[quant_key_str]
+        shorthand = online_shorthand_args(quant_key_str)
+        assert shorthand is not None
         if issubclass(layer_cls, LinearBase):
             quant_spec = shorthand.linear
             table = _ONLINE_LINEAR_METHODS
@@ -403,7 +416,9 @@ class OnlineQuantizationConfig(QuantizationConfig):
         # `targets` takes precedence over `moe` and `linear` and is exclusive.
         resolved = self.resolve_quant_method_cls(type(layer), prefix)
         if resolved is not None:
-            source, quant_key_str, target_pattern, _, quant_method_cls = resolved
+            source, quant_key_str, target_pattern, quant_spec, quant_method_cls = (
+                resolved
+            )
             self.quantized_layers[prefix] = (
                 source.value,
                 quant_key_str,
@@ -411,6 +426,8 @@ class OnlineQuantizationConfig(QuantizationConfig):
             )
             if isinstance(layer, RoutedExperts):
                 assert issubclass(quant_method_cls, FusedMoEMethodBase)
+                if quant_method_cls is Mxfp4MbsOnlineMoEMethod:
+                    return quant_method_cls(moe=layer.moe_config, quant_spec=quant_spec)
                 return quant_method_cls(moe=layer.moe_config)
 
             assert issubclass(quant_method_cls, OnlineLinearBase)

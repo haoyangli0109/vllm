@@ -115,6 +115,7 @@ Currently supported combinations are:
 | Serialized compressed-tensors NVFP4 MoE | any online MoE method | Target-specific hardware requirements |
 | Serialized ModelOpt NVFP4 MoE | any online MoE method | Target-specific hardware requirements |
 | Serialized Quark NVFP4 MoE | any online MoE method | Target-specific hardware requirements |
+| NVFP4 MoE experts of a ModelOpt MXFP8 checkpoint (`moe_quant_algo: NVFP4`, e.g. MiniMax-M3.1) | any online MoE method | Target-specific hardware requirements |
 
 For example, serialized ModelOpt MXFP8 linears can be converted to
 per-channel-weight/per-token-activation FP8 at load time:
@@ -138,6 +139,39 @@ vllm serve RedHatAI/Qwen3-30B-A3B-NVFP4 \
     Re-quantization is available for both linear and MoE layers.
 
     Checkpoint-exclusion policy is not enforced by online quantization/re-quantization. Only exclusion through `--quantization-config.targets`/`--quantization-config.ignore` is enforced. 
+
+### MXFP4 with macro block scaling (MoE)
+
+`mxfp4_mbs` is MXFP4 with Macro Block Scaling
+([arXiv:2603.08713](https://arxiv.org/abs/2603.08713)). On top of the 1x32 E8M0
+block scales, every macro block of consecutive K values in a row carries an
+8-bit mantissa factor f = 1 + m/256: the block is multiplied by f before MXFP4
+quantization and the GEMM divides it back out. It is an MoE-only online
+format, run by a Triton W4A4 fused MoE kernel on gfx950 (MI350/MI355), and is
+selected through `moe` or `targets` rather than `--quantization`:
+
+| Format | Macro block | Factors on |
+| ------ | ----------- | ---------- |
+| `mxfp4_mbs` | 128 | activations and weights |
+| `mxfp4_mbs256`, `mxfp4_mbs512`, `mxfp4_mbs1024` | 256 / 512 / 1024 | activations and weights |
+| `mxfp4_mbs_a`, `mxfp4_mbs<block>_a` | 128 / `<block>` | activations only (weights are plain MXFP4) |
+| `mxfp4_mbs_w`, `mxfp4_mbs<block>_w` | 128 / `<block>` | weights only (activations are plain MXFP4) |
+
+- Activations take the static factor from their macro block's absolute maximum.
+  Weights are quantized once at load time and search
+  `VLLM_MXFP4_MBS_WEIGHT_CANDIDATES` factors (default 16) for the smallest
+  squared error.
+- Every macro block costs the GEMM 2 FP32 multiplies per output (1 with
+  one-sided factors), so larger macro blocks and one-sided factors are faster.
+- Hidden and intermediate sizes must be multiples of the macro block (and of 128).
+
+For example, requantizing the NVFP4 experts of MiniMax-M3.1 (its dense layers
+stay MXFP8):
+
+```bash
+vllm serve MiniMaxAI/MiniMax-M3.1-Flash --language-model-only \
+  --quantization-config '{"moe": "mxfp4_mbs"}'
+```
 
 ### Online quantization on unquantized layers from partially-quantized checkpoints
 
